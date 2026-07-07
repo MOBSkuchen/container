@@ -19,16 +19,16 @@ pub struct ChildStg {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct Objects {
+pub struct InstanceCfg {
     pub objects_path: PathBuf,
     pub objects: Vec<Object>
 }
 
-impl Objects {
+impl InstanceCfg {
     pub async fn new(objects_path: PathBuf) -> anyhow::Result<Self> {
         if objects_path.exists() {
             let mut file = fs::File::open(objects_path).await?;
-            let objects = Objects::deserialize(&mut file).await?;
+            let objects = InstanceCfg::deserialize(&mut file).await?;
             Ok(objects)
         } else {
             Ok(Self {
@@ -40,24 +40,27 @@ impl Objects {
 }
 
 impl ChildStg {
-    pub async fn new(addr: SocketAddr, config_path: PathBuf, storage_path: PathBuf) -> anyhow::Result<(Self, Objects)> {
+    pub async fn new(addr: SocketAddr, config_path: PathBuf, storage_path: PathBuf) -> anyhow::Result<(Self, InstanceCfg)> {
+        if config_path.exists() {
+            fs::remove_file(&config_path).await?;
+        }
         fs::create_dir(&storage_path).await?;
-        let objects_path = storage_path.join("objects");
-        let mut f = fs::File::options().create(true).write(true).open(&config_path).await?;
+        let objects_path = storage_path.join("instances");
+        let mut f = fs::File::options().create_new(true).truncate(true).write(true).open(&config_path).await?;
         let ft = Self {
             addr,
             config_path,
             storage_path };
         ft.serialize(&mut f).await?;
         Ok((ft,
-            Objects::new(objects_path).await?)
+            InstanceCfg::new(objects_path).await?)
         )
     }
 
-    pub async fn load(config_path: PathBuf) -> anyhow::Result<(Self, Objects)> {
-        let mut f = fs::File::options().create(true).read(true).open(&config_path).await?;
+    pub async fn load(config_path: PathBuf) -> anyhow::Result<(Self, InstanceCfg)> {
+        let mut f = fs::File::options().read(true).open(&config_path).await?;
         let ft = ChildStg::deserialize(&mut f).await?;
-        let objects_path = ft.storage_path.join("objects");
-        Ok((ft, Objects::new(objects_path).await?))
+        let objects_path = ft.storage_path.join("instances");
+        Ok((ft, InstanceCfg::new(objects_path).await?))
     }
 }

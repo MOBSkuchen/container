@@ -10,4 +10,5 @@ clap = "4.6.1"
 clap_derive = "4.6.1"
 anyhow = "1.0.103"
 console = "0.16.4"
-tokio = "1.52.3"
+tokio = {version = "1.52.3", features = ["full"]}
+sysinfo = "0.39.5"
