@@ -35,8 +35,12 @@ where
     tokio::spawn(async move {
         let authed = tokio::time::timeout(ttl, async {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    return None;
+                let (mut stream, peer) = match listener.accept().await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        eprintln!("session on port {port}: accept failed: {e}");
+                        return None;
+                    }
                 };
                 let mut presented = [0u8; TOKEN_LEN];
                 let read = tokio::time::timeout(
@@ -45,15 +49,19 @@ where
                 ).await;
                 match read {
                     Ok(Ok(_)) if token_matches(&presented, &token) => return Some(stream),
-                    _ => continue,
+                    _ => eprintln!("session on port {port}: rejected connection from {peer} (bad or missing token)"),
                 }
             }
         }).await;
 
-        if let Ok(Some(mut stream)) = authed {
-            if stream.write_all(&[1u8]).await.is_ok() {
-                handler(stream).await;
+        match authed {
+            Ok(Some(mut stream)) => {
+                if stream.write_all(&[1u8]).await.is_ok() {
+                    handler(stream).await;
+                }
             }
+            Ok(None) => {}
+            Err(_) => eprintln!("session on port {port}: offer expired unused"),
         }
     });
 

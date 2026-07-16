@@ -245,7 +245,10 @@ impl InstanceManager {
             if let Some(mi) = instances.get_mut(&id) {
                 mi.repo = match result {
                     Ok(()) => RepoState::Ready,
-                    Err(e) => RepoState::CloneFailed(e),
+                    Err(e) => {
+                        eprintln!("instance {id:032x}: clone/update failed: {e}");
+                        RepoState::CloneFailed(e)
+                    }
                 };
             }
         });
@@ -488,6 +491,7 @@ async fn supervise(
             Err(e) => {
                 // A spawn failure is not a crash — restarting a missing binary
                 // just burns the budget. Fail loud and stop.
+                eprintln!("instance {:032x} ('{}'): spawn failed: {e}", config.id, config.name);
                 let _ = state.send(State::Failed { error: e.to_string() });
                 return;
             }
@@ -538,6 +542,7 @@ async fn supervise(
         let outcome = match run.finish().await {
             Ok(f) => f.outcome,
             Err(e) => {
+                eprintln!("instance {:032x} ('{}'): reaping process failed: {e}", config.id, config.name);
                 let _ = state.send(State::Failed { error: e.to_string() });
                 return;
             }

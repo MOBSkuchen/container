@@ -57,7 +57,14 @@ pub async fn attach_bridge(
 pub async fn shell_bridge(stream: TcpStream, shell: String, cwd: PathBuf) {
     let (mut sock_r, mut sock_w) = stream.into_split();
 
-    let Ok(group) = ProcessGroup::new() else { return };
+    let group = match ProcessGroup::new() {
+        Ok(group) => group,
+        Err(e) => {
+            eprintln!("shell terminal: creating process group failed: {e}");
+            let _ = sock_w.write_all(format!("failed to start shell: {e}\n").as_bytes()).await;
+            return;
+        }
+    };
     let cmd = Command::new(&shell)
         .current_dir(&cwd)
         .keep_stdin_open()
@@ -67,6 +74,7 @@ pub async fn shell_bridge(stream: TcpStream, shell: String, cwd: PathBuf) {
     let mut run = match group.start(&cmd).await {
         Ok(run) => run,
         Err(e) => {
+            eprintln!("shell terminal: starting '{shell}' failed: {e}");
             let _ = sock_w.write_all(format!("failed to start shell: {e}\n").as_bytes()).await;
             return;
         }

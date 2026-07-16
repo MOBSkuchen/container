@@ -41,7 +41,9 @@ async fn _init(config_file: PathBuf) -> anyhow::Result<()> {
 }
 
 async fn _start(config_path: PathBuf) -> anyhow::Result<()> {
-    let (stg, instances) = ChildStg::load(config_path).await?;
+    use anyhow::Context;
+    let (stg, instances) = ChildStg::load(config_path.clone()).await
+        .with_context(|| format!("loading config '{}' (run `init` first?)", config_path.display()))?;
     let manager = InstanceManager::new(stg.clone(), instances);
     manager.autostart().await;
     let handler = Api::new(stg.clone(), manager.clone());
@@ -49,7 +51,7 @@ async fn _start(config_path: PathBuf) -> anyhow::Result<()> {
     println!("Starting server on {}", stg.addr);
     let server = RpcServer::<Action, Response, _>::new(stg.addr, handler)
         .await
-        .expect("Failed to bind server");
+        .map_err(|e| anyhow::anyhow!("failed to bind {}: {:?}", stg.addr, e))?;
 
     tokio::select! {
         _ = server.run(4) => {}
@@ -79,11 +81,8 @@ async fn _main() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() {
-    let result = _main().await;
-    match result {
-        Ok(_) => {}
-        Err(e) => {
-            print!("Error: {:#?}", e);
-        }
+    if let Err(e) = _main().await {
+        eprintln!("Error: {e:#}");
+        std::process::exit(1);
     }
 }

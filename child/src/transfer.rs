@@ -48,50 +48,72 @@ pub fn resolve_path(stg: &ChildStg, requested: &Path) -> Result<PathBuf, ApiErro
 }
 
 /// Session handler: stream `path` to the client, length-prefixed.
-pub async fn send_file(mut stream: TcpStream, path: PathBuf) {
-    let Ok(mut file) = fs::File::open(&path).await else { return };
-    let Ok(meta) = file.metadata().await else { return };
-    if stream.write_all(&meta.len().to_be_bytes()).await.is_err() {
-        return;
+pub async fn send_file(stream: TcpStream, path: PathBuf) {
+    if let Err(e) = send_inner(stream, &path).await {
+        eprintln!("download of '{}' failed: {e}", path.display());
     }
-    let _ = tokio::io::copy(&mut file, &mut stream).await;
-    let _ = stream.shutdown().await;
+}
+
+async fn send_inner(mut stream: TcpStream, path: &Path) -> std::io::Result<()> {
+    let mut file = fs::File::open(path).await?;
+    let meta = file.metadata().await?;
+    stream.write_all(&meta.len().to_be_bytes()).await?;
+    tokio::io::copy(&mut file, &mut stream).await?;
+    stream.shutdown().await?;
+    Ok(())
 }
 
 /// Session handler: receive a length-prefixed file into `path`. Data lands in
 /// a `.part` file first so a dropped connection never leaves a truncated file
 /// at the final path.
-pub async fn receive_file(mut stream: TcpStream, path: PathBuf) {
-    if let Some(parent) = path.parent()
-        && fs::create_dir_all(parent).await.is_err() {
-        return;
+pub async fn receive_file(stream: TcpStream, path: PathBuf) {
+    if let Err(e) = receive_inner(stream, &path).await {
+        eprintln!("upload to '{}' failed: {e}", path.display());
+    }
+}
+
+async fn receive_inner(mut stream: TcpStream, path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
     }
 
     let mut len_buf = [0u8; 8];
-    if stream.read_exact(&mut len_buf).await.is_err() {
-        return;
-    }
+    stream.read_exact(&mut len_buf).await?;
     let len = u64::from_be_bytes(len_buf);
 
     let part = path.with_extension("part");
-    let Ok(mut file) = fs::File::create(&part).await else { return };
-
-    let mut limited = (&mut stream).take(len);
-    let copied = tokio::io::copy(&mut limited, &mut file).await;
-    let complete = matches!(copied, Ok(n) if n == len) && file.flush().await.is_ok();
-    drop(file);
-
-    if complete {
-        if path.exists() && fs::remove_file(&path).await.is_err() {
-            let _ = fs::remove_file(&part).await;
-            return;
+    let received = async {
+        let mut file = fs::File::create(&part).await?;
+        let mut limited = (&mut stream).take(len);
+        let copied = tokio::io::copy(&mut limited, &mut file).await?;
+        if copied != len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("connection closed after {copied} of {len} bytes"),
+            ));
         }
-        if fs::rename(&part, &path).await.is_ok() {
-            // Ack so the client knows the file was committed, not just sent.
-            let _ = stream.write_all(&[1u8]).await;
-        }
-    } else {
+        file.flush().await
+    }.await;
+
+    let swapped = match received {
+        Ok(()) => async {
+            if path.exists() {
+                fs::remove_file(path).await?;
+            }
+            fs::rename(&part, path).await
+        }.await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = swapped {
         let _ = fs::remove_file(&part).await;
+        return Err(e);
+    }
+
+    // Ack so the client knows the file was committed, not just sent. The file
+    // is already in place, so an ack failure is only worth a note.
+    if let Err(e) = stream.write_all(&[1u8]).await {
+        eprintln!("upload to '{}': committed, but the client ack failed: {e}", path.display());
     }
     let _ = stream.shutdown().await;
+    Ok(())
 }
