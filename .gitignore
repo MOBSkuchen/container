@@ -2,3 +2,5 @@
 .*
 *.lock
 .idea/
+config.chld
+ctchld/

@@ -12,3 +12,7 @@ anyhow = "1.0.103"
 console = "0.16.4"
 tokio = {version = "1.52.3", features = ["full"]}
 sysinfo = "0.39.5"
+processkit = { version = "2.2.3", features = ["stats"] }
+futures = "0.3.32"
+gix = { version = "0.84", features = ["blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation"] }
+rand = "0.10.2"

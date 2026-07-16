@@ -1,8 +1,6 @@
-use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::str::FromStr;
-use clap::{Parser, Subcommand, command};
-use clap_derive::{Args, Parser, Subcommand};
+use clap_derive::{Parser, Subcommand};
 use console::{style, Term};
 
 #[derive(Parser)]
@@ -46,7 +44,7 @@ where <CastType as FromStr>::Err: std::error::Error,
         return Ok(default)
     }
     let v = input.parse::<CastType>();
-    if let Err(e) = v {
+    if v.is_err() {
         term.clear_line()?;
         term.move_cursor_up(2)?;
         term.clear_line()?;
