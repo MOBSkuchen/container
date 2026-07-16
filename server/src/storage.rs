@@ -23,7 +23,7 @@ pub struct InstanceConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct ChildStg {
+pub struct ServerStg {
     pub addr: SocketAddr,
     pub config_path: PathBuf,
     pub storage_path: PathBuf,
@@ -39,7 +39,7 @@ pub fn default_shell() -> String {
     if cfg!(windows) { "cmd.exe".to_string() } else { "/bin/sh".to_string() }
 }
 
-impl ChildStg {
+impl ServerStg {
     pub fn instances_index_path(&self) -> PathBuf {
         self.storage_path.join("instances.chld")
     }
@@ -85,7 +85,7 @@ impl ChildStg {
 
     pub async fn load(config_path: PathBuf) -> anyhow::Result<(Self, Vec<InstanceConfig>)> {
         let mut f = fs::File::options().read(true).open(&config_path).await?;
-        let ft = ChildStg::deserialize(&mut f).await?;
+        let ft = ServerStg::deserialize(&mut f).await?;
         fs::create_dir_all(ft.instances_dir()).await?;
         let instances = ft.load_instances().await?;
         Ok((ft, instances))

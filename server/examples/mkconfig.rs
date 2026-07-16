@@ -6,7 +6,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
-use child::storage::{default_shell, ChildStg};
+use server::storage::{default_shell, ServerStg};
 
 #[tokio::main]
 async fn main() {
@@ -15,7 +15,7 @@ async fn main() {
     let config = PathBuf::from(args.next().expect("config path"));
     let storage = PathBuf::from(args.next().expect("storage path"));
     let roots: Vec<PathBuf> = args.map(PathBuf::from).collect();
-    ChildStg::new(addr, config, storage, roots, 30, default_shell())
+    ServerStg::new(addr, config, storage, roots, 30, default_shell())
         .await
         .expect("init failed");
     println!("config written");

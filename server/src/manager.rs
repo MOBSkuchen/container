@@ -10,7 +10,7 @@ use tokio::sync::{broadcast, watch, Mutex};
 use tokio::task::JoinHandle;
 use crate::api::{ApiError, ErrorCode};
 use crate::gitops;
-use crate::storage::{ChildStg, InstanceConfig};
+use crate::storage::{ServerStg, InstanceConfig};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum RetryPolicy {
@@ -164,7 +164,7 @@ pub struct InstancePatch {
 }
 
 pub struct InstanceManager {
-    stg: ChildStg,
+    stg: ServerStg,
     instances: Mutex<HashMap<u128, ManagedInstance>>,
 }
 
@@ -173,7 +173,7 @@ fn err(code: ErrorCode, msg: impl Into<String>) -> ApiError {
 }
 
 impl InstanceManager {
-    pub fn new(stg: ChildStg, configs: Vec<InstanceConfig>) -> Arc<Self> {
+    pub fn new(stg: ServerStg, configs: Vec<InstanceConfig>) -> Arc<Self> {
         let mut instances = HashMap::new();
         for config in configs {
             let repo = if stg.repo_dir(config.id).exists() {

@@ -4,10 +4,10 @@ use std::str::FromStr;
 use bierpc::RpcServer;
 use clap::Parser;
 use console::Term;
-use child::api::{Action, Api, Response};
-use child::cli::{self, gather_value_routine, Commands};
-use child::manager::InstanceManager;
-use child::storage::{default_shell, ChildStg};
+use server::api::{Action, Api, Response};
+use server::cli::{self, gather_value_routine, Commands};
+use server::manager::InstanceManager;
+use server::storage::{default_shell, ServerStg};
 
 async fn _init(config_file: PathBuf) -> anyhow::Result<()> {
     let term = Term::stdout();
@@ -26,7 +26,7 @@ async fn _init(config_file: PathBuf) -> anyhow::Result<()> {
         .map(PathBuf::from)
         .collect();
 
-    let (child_stg, _instances) = ChildStg::new(
+    let (server_stg, _instances) = ServerStg::new(
         SocketAddr::V4(addr),
         config_path,
         storage_path,
@@ -35,14 +35,14 @@ async fn _init(config_file: PathBuf) -> anyhow::Result<()> {
         shell,
     ).await?;
 
-    term.write_line(format!("Initialized to {:#?}", child_stg.config_path).as_str())?;
+    term.write_line(format!("Initialized to {:#?}", server_stg.config_path).as_str())?;
 
     Ok(())
 }
 
 async fn _start(config_path: PathBuf) -> anyhow::Result<()> {
     use anyhow::Context;
-    let (stg, instances) = ChildStg::load(config_path.clone()).await
+    let (stg, instances) = ServerStg::load(config_path.clone()).await
         .with_context(|| format!("loading config '{}' (run `init` first?)", config_path.display()))?;
     let manager = InstanceManager::new(stg.clone(), instances);
     manager.autostart().await;

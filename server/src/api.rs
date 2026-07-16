@@ -9,7 +9,7 @@ use bierpc::error::RpcResult;
 use bierpc::RpcServerHandler;
 use sysinfo::{Disks, Networks, System};
 use crate::manager::{InstanceManager, InstancePatch, InstanceStatResponse, InstanceStatus, RetryPolicy};
-use crate::storage::{ChildStg, InstanceConfig};
+use crate::storage::{ServerStg, InstanceConfig};
 use crate::{session, terminal, transfer};
 
 // NOTE on named-field enum variants: bier_derive emits `Type::deserialize(...)`
@@ -126,12 +126,12 @@ fn respond(result: Result<Response, ApiError>) -> RR {
 }
 
 pub struct Api {
-    stg: ChildStg,
+    stg: ServerStg,
     manager: Arc<InstanceManager>,
 }
 
 impl Api {
-    pub fn new(stg: ChildStg, manager: Arc<InstanceManager>) -> Self {
+    pub fn new(stg: ServerStg, manager: Arc<InstanceManager>) -> Self {
         Self { stg, manager }
     }
 

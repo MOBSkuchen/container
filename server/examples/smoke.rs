@@ -15,8 +15,8 @@ use std::time::Duration;
 use bierpc::RpcClient;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use child::api::{Action, ErrorCode, Response, TerminalMode};
-use child::manager::{RepoState, RetryPolicy, RunState};
+use server::api::{Action, ErrorCode, Response, TerminalMode};
+use server::manager::{RepoState, RetryPolicy, RunState};
 
 async fn call(addr: SocketAddr, action: Action) -> Response {
     // The server handles one action per connection, so dial fresh each time.

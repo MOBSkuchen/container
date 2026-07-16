@@ -3,7 +3,7 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use crate::api::{ApiError, ErrorCode};
-use crate::storage::ChildStg;
+use crate::storage::ServerStg;
 
 // Session protocol after the token handshake (both directions):
 //   [u64 big-endian length][exactly that many bytes]
@@ -15,7 +15,7 @@ use crate::storage::ChildStg;
 /// dir. Relative paths resolve against the storage path. `..` components are
 /// rejected outright, so a normalized prefix check suffices (symlinks inside
 /// an allowed root are considered the operator's choice).
-pub fn resolve_path(stg: &ChildStg, requested: &Path) -> Result<PathBuf, ApiError> {
+pub fn resolve_path(stg: &ServerStg, requested: &Path) -> Result<PathBuf, ApiError> {
     if requested.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(ApiError {
             code: ErrorCode::AccessDenied,
