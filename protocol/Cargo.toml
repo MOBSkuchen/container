@@ -1,0 +1,14 @@
+[package]
+name = "protocol"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bier_derive = { path = "../../rpc/bier_derive" }
+bierpc = { path = "../../rpc/bierpc" }
+# bier_derive's generated code refers to `tokio` directly.
+tokio = { version = "1.52.3", features = ["io-util"] }
+sha3 = "0.10.8"
+sha2 = "0.10.9"
+hmac = "0.12.1"
+getrandom = "0.4.3"
