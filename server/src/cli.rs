@@ -21,7 +21,18 @@ pub enum Commands {
         bootstrap: bool
     },
     #[command(long_about = "Initializes a new instance")]
-    Init
+    Init,
+    #[command(long_about = "Generates the shared authentication key and saves it to the config")]
+    Keygen {
+        #[arg(long_help = "Passphrase to derive the key from. Run keygen with the same phrase on \
+                           the client to pair them. Omit it for a random key, which must then be \
+                           copied across by hand.")]
+        phrase: Option<String>,
+
+        #[arg(long, conflicts_with = "phrase",
+              long_help = "Use a key printed by `client keygen` verbatim, as hex.")]
+        key: Option<String>,
+    },
 }
 
 fn _user_input_read_as<CastType: FromStr + Send + Sync + std::fmt::Debug>(term: &Term, initial: &str, default: Option<CastType>) -> anyhow::Result<CastType>

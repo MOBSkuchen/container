@@ -56,6 +56,10 @@ where
 
         match authed {
             Ok(Some(mut stream)) => {
+                // Terminal sessions echo keystrokes over this socket; Nagle
+                // would turn each echo into visible typing lag. Bulk transfer
+                // sessions don't care either way.
+                let _ = stream.set_nodelay(true);
                 if stream.write_all(&[1u8]).await.is_ok() {
                     handler(stream).await;
                 }

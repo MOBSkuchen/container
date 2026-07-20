@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 bier_derive = {path = "../../rpc/bier_derive" }
 bierpc = {path = "../../rpc/bierpc" }
+protocol = { path = "../protocol" }
 clap = "4.6.1"
 clap_derive = "4.6.1"
 anyhow = "1.0.103"
@@ -16,3 +17,7 @@ processkit = { version = "2.2.3", features = ["stats"] }
 futures = "0.3.32"
 gix = { version = "0.84", features = ["blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation"] }
 rand = "0.10.2"
+portable-pty = "0.9.0"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }

@@ -1,33 +1,67 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
-use bier_derive::{Deserialize, Serialize};
-use bierpc::serialize::{Serialize, Deserialize};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures::StreamExt;
-use processkit::{CancellationToken, Command, LineTerminator, Outcome, ProcessGroup, ProcessStdin};
+use processkit::{CancellationToken, Command, LineTerminator, Outcome, OutputEvent, ProcessGroup, ProcessStdin};
 use tokio::sync::{broadcast, watch, Mutex};
 use tokio::task::JoinHandle;
 use crate::api::{ApiError, ErrorCode};
 use crate::gitops;
 use crate::storage::{ServerStg, InstanceConfig};
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum RetryPolicy {
-    Never,
-    OnCrash,
-    Always,
-    Retry(u32),
+// Wire types come from the shared `protocol` crate; only the types that touch
+// processkit (`State`) or the manager's internals stay here.
+pub use protocol::instance::{
+    ConsoleLine, GroupStats, InstanceStatResponse, InstanceStatus, RepoState, RetryPolicy,
+    RunState, Stream,
+};
+
+/// How many console lines are kept per instance. Bounded because an instance
+/// can run for weeks and nothing else prunes this.
+pub const CONSOLE_CAPACITY: usize = 1000;
+
+/// Recent console output, oldest first, with a count of what has aged out so
+/// the client can say so rather than imply the instance started mid-stream.
+#[derive(Default)]
+pub struct Console {
+    lines: VecDeque<ConsoleLine>,
+    dropped: u64,
 }
 
-impl RetryPolicy {
-    pub fn should_restart(&self, outcome: &Outcome, restarts: u32) -> bool {
-        match self {
-            RetryPolicy::Never => false,
-            RetryPolicy::OnCrash => !matches!(outcome, Outcome::Exited(0)),
-            RetryPolicy::Always => true,
-            RetryPolicy::Retry(n) => restarts < *n,
+impl Console {
+    fn push(&mut self, stream: Stream, text: String) {
+        if self.lines.len() == CONSOLE_CAPACITY {
+            self.lines.pop_front();
+            self.dropped += 1;
         }
+        self.lines.push_back(ConsoleLine {
+            at_ms: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
+            stream,
+            text,
+        });
+    }
+
+    /// A marker line of our own, so restarts are visible in the scrollback.
+    fn note(&mut self, text: impl Into<String>) {
+        self.push(Stream::Stdout, format!("── {} ──", text.into()));
+    }
+
+    fn tail(&self, lines: usize) -> (Vec<ConsoleLine>, u64) {
+        let skip = self.lines.len().saturating_sub(lines);
+        // Anything skipped here is also "not shown", from the caller's view.
+        (self.lines.iter().skip(skip).cloned().collect(), self.dropped + skip as u64)
+    }
+}
+
+/// `RetryPolicy` is a wire type, so this cannot be an inherent method: the
+/// decision needs processkit's `Outcome`.
+pub fn should_restart(policy: &RetryPolicy, outcome: &Outcome, restarts: u32) -> bool {
+    match policy {
+        RetryPolicy::Never => false,
+        RetryPolicy::OnCrash => !matches!(outcome, Outcome::Exited(0)),
+        RetryPolicy::Always => true,
+        RetryPolicy::Retry(n) => restarts < *n,
     }
 }
 
@@ -56,18 +90,6 @@ impl State {
     }
 }
 
-/// Wire-format mirror of `State` (processkit's `Outcome` is not serializable).
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum RunState {
-    NotRunning,
-    Starting,
-    Running { pids: Vec::<u32>, restarts: u32 },
-    Backoff { delay_ms: u64, restarts: u32 },
-    Exited { code: Option::<i32>, signal: Option::<i32>, restarts: u32 },
-    Stopped,
-    Failed(String),
-}
-
 impl From<&State> for RunState {
     fn from(s: &State) -> Self {
         match s {
@@ -88,38 +110,6 @@ impl From<&State> for RunState {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum RepoState {
-    /// Clone/update in progress; the instance cannot run yet.
-    Provisioning,
-    Ready,
-    CloneFailed(String),
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct GroupStats {
-    pub processes: u64,
-    pub cpu_time_ms: Option<u64>,
-    pub peak_memory_bytes: Option<u64>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct InstanceStatus {
-    pub config: InstanceConfig,
-    pub repo: RepoState,
-    pub run: RunState,
-    pub stats: Option<GroupStats>,
-}
-
-/// Compact per-instance entry used in `Stat` / `ListInstances`.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct InstanceStatResponse {
-    pub id: u128,
-    pub name: String,
-    pub repo: RepoState,
-    pub run: RunState,
-}
-
 /// A live (or finished-but-not-cleared) supervised run of one instance.
 struct Service {
     group: Arc<ProcessGroup>,
@@ -136,6 +126,9 @@ struct ManagedInstance {
     config: InstanceConfig,
     repo: RepoState,
     service: Option<Service>,
+    /// Survives restarts on purpose: the output that explains why an instance
+    /// crashed is written before the restart, not after.
+    console: Arc<std::sync::Mutex<Console>>,
 }
 
 impl ManagedInstance {
@@ -181,7 +174,9 @@ impl InstanceManager {
             } else {
                 RepoState::CloneFailed("repo directory missing; run UpdateRepo".to_string())
             };
-            instances.insert(config.id, ManagedInstance { config, repo, service: None });
+            instances.insert(config.id, ManagedInstance {
+                config, repo, service: None, console: Default::default(),
+            });
         }
         Arc::new(Self { stg, instances: Mutex::new(instances) })
     }
@@ -218,7 +213,9 @@ impl InstanceManager {
             if instances.values().any(|mi| mi.config.name == config.name) {
                 return Err(err(ErrorCode::Conflict, format!("an instance named '{}' already exists", config.name)));
             }
-            instances.insert(id, ManagedInstance { config, repo: RepoState::Provisioning, service: None });
+            instances.insert(id, ManagedInstance {
+                config, repo: RepoState::Provisioning, service: None, console: Default::default(),
+            });
             self.persist(&instances).await?;
         }
 
@@ -321,6 +318,7 @@ impl InstanceManager {
             cancel.clone(),
             stdin.clone(),
             output_tx.clone(),
+            mi.console.clone(),
         ));
 
         mi.service = Some(Service { group, state: state_rx, cancel, task, stdin, output_tx });
@@ -404,6 +402,7 @@ impl InstanceManager {
             repo: mi.repo.clone(),
             run: mi.run_state(),
             stats,
+            repo_dir: self.stg.repo_dir(id),
         })
     }
 
@@ -415,6 +414,14 @@ impl InstanceManager {
             repo: mi.repo.clone(),
             run: mi.run_state(),
         })).collect()
+    }
+
+    /// The tail of an instance's captured console output, newest last.
+    pub async fn tail_console(&self, id: u128, lines: usize) -> Result<(Vec<ConsoleLine>, u64), ApiError> {
+        let instances = self.instances.lock().await;
+        let mi = instances.get(&id).ok_or_else(|| err(ErrorCode::NotFound, "no such instance"))?;
+        let console = mi.console.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(console.tail(lines))
     }
 
     /// Terminal-attach hooks for a running instance: an output subscription and
@@ -474,9 +481,11 @@ async fn supervise(
     cancel: CancellationToken,
     stdin_slot: Arc<Mutex<Option<ProcessStdin>>>,
     output_tx: broadcast::Sender<Vec<u8>>,
+    console: Arc<std::sync::Mutex<Console>>,
 ) {
     let mut restarts: u32 = 0;
     let cmd = build_command(&config, &repo_dir);
+    let note = |text: String| console.lock().unwrap_or_else(|e| e.into_inner()).note(text);
 
     loop {
         if cancel.is_cancelled() {
@@ -492,10 +501,16 @@ async fn supervise(
                 // A spawn failure is not a crash — restarting a missing binary
                 // just burns the budget. Fail loud and stop.
                 eprintln!("instance {:032x} ('{}'): spawn failed: {e}", config.id, config.name);
+                note(format!("failed to start: {e}"));
                 let _ = state.send(State::Failed { error: e.to_string() });
                 return;
             }
         };
+        note(if restarts == 0 {
+            "started".to_string()
+        } else {
+            format!("restarted (attempt {})", restarts + 1)
+        });
 
         *stdin_slot.lock().await = run.take_stdin();
 
@@ -518,11 +533,20 @@ async fn supervise(
                 } => {
                     match ev {
                         Some(event) => {
-                            if output_tx.receiver_count() > 0
-                                && let Some(text) = event.text() {
-                                let mut chunk = text.as_bytes().to_vec();
-                                chunk.push(b'\n');
-                                let _ = output_tx.send(chunk);
+                            // Captured unconditionally: the console must hold
+                            // what happened even with nobody attached.
+                            if let Some(text) = event.text() {
+                                let stream = match &event {
+                                    OutputEvent::Stderr(_) => Stream::Stderr,
+                                    _ => Stream::Stdout,
+                                };
+                                console.lock().unwrap_or_else(|e| e.into_inner())
+                                    .push(stream, text.to_string());
+                                if output_tx.receiver_count() > 0 {
+                                    let mut chunk = text.as_bytes().to_vec();
+                                    chunk.push(b'\n');
+                                    let _ = output_tx.send(chunk);
+                                }
                             }
                         }
                         None => break false,
@@ -535,6 +559,7 @@ async fn supervise(
 
         if cancelled {
             let _ = group.shutdown_ref().await;
+            note("stopped".to_string());
             let _ = state.send(State::Stopped);
             return;
         }
@@ -548,10 +573,12 @@ async fn supervise(
             }
         };
 
-        if !config.retry_policy.should_restart(&outcome, restarts) {
+        if !should_restart(&config.retry_policy, &outcome, restarts) {
+            note(format!("exited: {outcome:?} — not restarting"));
             let _ = state.send(State::Exited { outcome, restarts });
             return;
         }
+        note(format!("exited: {outcome:?}"));
 
         restarts += 1;
         let delay = backoff_delay(restarts);

@@ -1,8 +1,9 @@
 use std::path::{Component, Path, PathBuf};
+use std::time::UNIX_EPOCH;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use crate::api::{ApiError, ErrorCode};
+use crate::api::{ApiError, DirEntry, ErrorCode};
 use crate::storage::ServerStg;
 
 // Session protocol after the token handshake (both directions):
@@ -45,6 +46,36 @@ pub fn resolve_path(stg: &ServerStg, requested: &Path) -> Result<PathBuf, ApiErr
         code: ErrorCode::AccessDenied,
         msg: "path is outside the configured file roots".to_string(),
     })
+}
+
+/// List a directory that has already passed `resolve_path`. Entries that
+/// cannot be stat'd (races, permissions) are skipped rather than failing the
+/// whole listing; directories sort first, then names, case-insensitively.
+pub async fn list_dir(path: &Path) -> Result<Vec<DirEntry>, ApiError> {
+    let mut read_dir = fs::read_dir(path).await.map_err(|e| ApiError {
+        code: ErrorCode::NotFound,
+        msg: format!("cannot list '{}': {e}", path.display()),
+    })?;
+
+    let mut entries = Vec::new();
+    while let Some(entry) = read_dir.next_entry().await.map_err(|e| ApiError {
+        code: ErrorCode::Internal,
+        msg: format!("reading '{}': {e}", path.display()),
+    })? {
+        let Ok(meta) = entry.metadata().await else { continue };
+        entries.push(DirEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            is_dir: meta.is_dir(),
+            size: meta.len(),
+            modified_secs: meta.modified().ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs()),
+        });
+    }
+
+    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir)
+        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    Ok(entries)
 }
 
 /// Session handler: stream `path` to the client, length-prefixed.
