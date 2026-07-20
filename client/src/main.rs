@@ -13,8 +13,7 @@ use client::{target, terminal};
 #[derive(Parser)]
 #[command(version, about = "Manage container servers and their instances", long_about = None)]
 struct Cli {
-    /// Server list to use (default: the per-user config directory).
-    #[arg(short = 'c', long = "config", global = true)]
+    #[arg(help = "Config file where servers and instances are kept track of", long_help = "Config file where servers and instances are kept track of. Defaults to user storage.", short = 'c', long = "config", global = true)]
     config: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -23,40 +22,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Attach to a running instance's process, like `docker attach`.
-    ///
-    /// The supervised process runs on pipes, not a terminal, so this is
-    /// line-oriented: no echo from the far end, no escape sequences. Ctrl+C
-    /// detaches and the instance keeps running.
+    #[command(about = "Attaches the console to the output of an instance", long_about = "Attaches the console to the output of an instance. Use Ctrl+C to detach.")]
     Attach {
-        /// `server/instance`, or just `instance` if the name is unambiguous.
+        #[arg(help = "<server>/<instance> or just <server> if the name is unambiguous")]
         target: String,
     },
-    /// Open a new shell in an instance's checkout, like `docker exec`.
-    ///
-    /// Runs against a real terminal on the server, so full-screen programs
-    /// work and every key — Ctrl+C included — goes through. Type `exit` to
-    /// end the session.
+    #[command(long_about = "Opens the shell on the remote server. Detaching requires exiting via remote (i.e. using exit)", about = "Opens the shell on the remote server.")]
     Shell {
-        /// `server/instance`, or just `instance` if the name is unambiguous.
+        #[arg(help = "<server>/<instance> or just <server> if the name is unambiguous")]
         target: String,
     },
-    /// Set the key used to authenticate with servers.
-    ///
-    /// Give the same passphrase the server was set up with and the two derive
-    /// an identical key without it ever crossing the network.
+    #[command(about = "Set the auth key with the server", long_about = "Derive, create and set the key for auth with a remote server.")]
     Keygen {
-        /// Passphrase to derive the key from. Omit for a random key, which
-        /// then has to be copied to the server by hand.
+        #[arg(help = "Phrase to derive key from.")]
         phrase: Option<String>,
 
-        /// Use a key printed by `server keygen` verbatim, as hex.
-        #[arg(long, conflicts_with = "phrase")]
+        #[arg(long, help = "Set an existing key instead of deriving it.", conflicts_with = "phrase")]
         key: Option<String>,
 
-        /// Set the key for one server only, instead of the default used by
-        /// every server that has none of its own.
-        #[arg(long, value_name = "NAME")]
+        #[arg(long, help = "Server to set key for, leave empty for default", value_name = "NAME")]
         server: Option<String>,
     },
 }
@@ -64,7 +48,7 @@ enum Command {
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
-        eprintln!("Error: {e:#}");
+        eprintln!("Error: {e}");
         std::process::exit(1);
     }
 }
