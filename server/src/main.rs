@@ -50,11 +50,11 @@ async fn _init(config_file: PathBuf) -> anyhow::Result<()> {
 /// re-derived there; a random one has to be copied.
 fn pairing_advice(key: &[u8], from_phrase: bool) -> String {
     if from_phrase {
-        "Pair a client with: client keygen <the same phrase>".to_string()
+        "Pair a client with: `client keygen <the same phrase>`".to_string()
     } else {
         format!(
             "This key is random, so nothing can re-derive it. Pair a client with:\n\
-             client keygen --key {}",
+             `client keygen --key {}`",
             auth::to_hex(key),
         )
     }
