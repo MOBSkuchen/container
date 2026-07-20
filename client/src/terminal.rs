@@ -1,19 +1,9 @@
 //! `client shell <target>` / `client attach <target>`.
 //!
-//! Terminals are a CLI mode, not a TUI screen: the app never has to suspend
-//! itself, and the session owns the console outright.
-//!
-//! The two modes are deliberately different, because what is on the far end
-//! differs:
-//!
-//! - **shell** runs against a real PTY. This end is a dumb conduit — every
-//!   byte goes straight through, `Ctrl+C` included, and the remote shell does
-//!   the echoing, line editing and screen drawing. Full-screen programs work.
-//!   The session ends when the shell does (`exit`), like PuTTY or ssh.
-//! - **attach** bridges to the *supervised* process, which runs on pipes with
-//!   no PTY. Nothing echoes and no escape sequence means anything, so this end
-//!   runs a small line editor, and `Ctrl+C` ends the session rather than being
-//!   forwarded — there is nothing on the far side that could act on it.
+//! `shell` runs against a real PTY and is a dumb conduit in both directions,
+//! Ctrl+C included, ending when the shell does. `attach` bridges to the
+//! supervised process, which runs on pipes with no PTY, so this end runs a
+//! small line editor and Ctrl+C ends the session instead of being forwarded.
 
 use std::time::Duration;
 
@@ -28,16 +18,13 @@ use tokio::net::TcpStream;
 use crate::console::RawConsole;
 use crate::net::{self, Endpoint};
 
-/// How often the local window size is compared against the last one sent.
-/// Unix only — its shell pump forwards raw stdin bytes, so reading resize
+/// Unix only: its shell pump forwards raw stdin bytes, so reading resize
 /// events would mean sharing stdin with the byte pump; Windows gets resizes
 /// as console events instead.
 #[cfg(not(windows))]
 const RESIZE_POLL: Duration = Duration::from_millis(250);
 
-/// Ask for a session, then connect to the side-channel port and complete the
-/// token handshake. Split out from the bridges so it can be exercised without
-/// a TTY: everything after this point needs a real console.
+/// Split out from the bridges so it can be exercised without a TTY.
 pub async fn open_session(endpoint: &Endpoint, mode: TerminalMode) -> anyhow::Result<TcpStream> {
     let addr = endpoint.addr;
     let (port, token, ttl_secs) = match net::call(endpoint, Action::OpenTerminal { mode }).await {
@@ -53,8 +40,7 @@ pub async fn open_session(endpoint: &Endpoint, mode: TerminalMode) -> anyhow::Re
         .with_context(|| format!("session port {port} did not accept a connection within {ttl_secs}s"))?
         .with_context(|| format!("connecting to session port {port}"))?;
 
-    // Interactive sessions ride this socket: a keystroke and its echo are
-    // both tiny writes, and Nagle would batch them into visible typing lag.
+    // Nagle would batch a keystroke and its echo into visible typing lag.
     let _ = stream.set_nodelay(true);
 
     stream.write_all(&token).await.context("sending the session token")?;
@@ -66,8 +52,6 @@ pub async fn open_session(endpoint: &Endpoint, mode: TerminalMode) -> anyhow::Re
     Ok(stream)
 }
 
-/// The local window size, or a conventional default if it cannot be read
-/// (piped stdout, for instance) — a pty still needs *some* size.
 pub fn window_size() -> (u16, u16) {
     crossterm::terminal::size().unwrap_or((80, 24))
 }
@@ -88,32 +72,29 @@ pub async fn shell(endpoint: &Endpoint, id: u128, label: &str) -> anyhow::Result
     Ok(())
 }
 
-/// The debug tee: `CONTAINER_SHELL_TEE=<path>` also writes everything the
-/// server sends into a file — the exact bytes the local terminal has to
-/// render, for diagnosing "my terminal shows garbage" without guessing.
+/// `CONTAINER_SHELL_TEE=<path>` writes everything the server sends into a
+/// file, for diagnosing "my terminal shows garbage" without guessing.
 fn open_tee() -> Option<std::fs::File> {
     std::env::var_os("CONTAINER_SHELL_TEE").and_then(|path| std::fs::File::create(path).ok())
 }
 
-/// What the output filter decided about one recognized escape sequence.
 #[cfg(windows)]
 enum Intercept {
-    /// `\e[6n`: the remote pty is asking its terminal where the cursor is —
-    /// and blocks its whole output pipeline until somebody answers.
+    /// `\e[6n`: the remote pty is asking its terminal where the cursor is,
+    /// and blocks its output pipeline until answered.
     CursorQuery,
-    /// Swallowed with no reply owed (`\e[?9001h`: ConPTY asking its terminal
-    /// to switch to win32-input-mode. Letting it reach the local console
-    /// would flip *our* input into that encoding — every keystroke arrives
-    /// as escape-sequence spam — and we already send ConPTY plain VT.)
+    /// `\e[?9001h/l`: ConPTY asking its terminal to switch to
+    /// win32-input-mode. Letting it reach the local console would flip our
+    /// own input into that encoding, so it's swallowed with no reply.
     Drop,
 }
 
-/// Recognizes, and removes from the printable stream, the few sequences the
-/// remote pty addresses *at the terminal* rather than at the screen. They
-/// must not reach the local console: the console would inject its reply into
-/// our own input queue, where the event decoder mangles it beyond repair
-/// (evt_probe shows a `\e[..R` reply coming back as a phantom F3 key).
-/// Instead the pump answers on the socket itself, like a terminal emulator.
+/// Removes from the printable stream the few sequences the remote pty
+/// addresses at the terminal rather than the screen — they must not reach
+/// the local console, which would inject its reply into our own input queue
+/// and get mangled by the event decoder (evt_probe showed a `\e[..R` reply
+/// arriving back as a phantom F3 key). The pump answers on the socket
+/// itself instead, like a terminal emulator would.
 #[cfg(windows)]
 #[derive(Default)]
 struct OutputFilter {
@@ -129,8 +110,8 @@ impl OutputFilter {
         (b"\x1b[?9001l", Intercept::Drop),
     ];
 
-    /// Split a chunk into what should be printed and how many cursor queries
-    /// were removed from it. A trailing partial candidate is held back until
+    /// Splits a chunk into what should be printed and how many cursor
+    /// queries were removed. A trailing partial match is held back until
     /// the next chunk decides what it was.
     fn feed(&mut self, chunk: &[u8]) -> (Vec<u8>, u32) {
         let mut data = std::mem::take(&mut self.carry);
@@ -151,7 +132,6 @@ impl OutputFilter {
                         continue 'scan;
                     }
                     if pattern.starts_with(rest) {
-                        // Might complete in the next chunk; hold it back.
                         self.carry = rest.to_vec();
                         break 'scan;
                     }
@@ -164,22 +144,14 @@ impl OutputFilter {
     }
 }
 
-/// Raw conduit outward, decoded key events inward.
-///
-/// Output is written to the console verbatim — minus the handful of
-/// terminal-addressed queries `OutputFilter` intercepts, which the pump
-/// answers itself the way PuTTY would. Input cannot be raw at all on
-/// Windows: a console *byte* read only ever yields character keys — arrows,
-/// function keys and Ctrl+C never appear in the stream no matter which
-/// console modes are set (evt_probe demonstrates this). So the decoded
-/// events are read, the same way the TUI reads them, and each key is
-/// re-encoded into the escape sequence a terminal would have sent — which
-/// the far side's ConPTY parses right back into key events for the shell.
-/// Resizes arrive as events too, so no polling.
+/// A console byte read never yields arrows, function keys or Ctrl+C, no
+/// matter which console modes are set (evt_probe demonstrates this), so
+/// this reads decoded events instead — the same API the TUI uses — and
+/// re-encodes each key into the escape sequence a terminal would have sent,
+/// which ConPTY on the far side parses back into key events for the shell.
 #[cfg(windows)]
 async fn pump_shell(stream: TcpStream, cols: u16, rows: u16) -> anyhow::Result<()> {
-    // The pty was created at this size already; only changes matter now.
-    let _ = (cols, rows);
+    let _ = (cols, rows); // the pty was already created at this size
 
     let (mut sock_r, mut sock_w) = stream.into_split();
     let mut stdout = tokio::io::stdout();
@@ -197,10 +169,9 @@ async fn pump_shell(stream: TcpStream, cols: u16, rows: u16) -> anyhow::Result<(
     let mut from_remote = [0u8; 8192];
     let mut filter = OutputFilter::default();
 
-    // Keys that arrived as a Press. A Release is normally the echo of one of
-    // these and must be dropped or every keystroke doubles — but some events
-    // only ever arrive as a Release (a ^C synthesized from pasted input, for
-    // one), and dropping those would lose real keystrokes.
+    // A Release normally echoes a tracked Press and must be dropped or every
+    // keystroke doubles — except a Release with no matching Press (a ^C
+    // synthesized from pasted input can arrive that way), which must not be.
     let mut pressed: std::collections::HashSet<(KeyCode, KeyModifiers)> =
         std::collections::HashSet::new();
 
@@ -208,7 +179,6 @@ async fn pump_shell(stream: TcpStream, cols: u16, rows: u16) -> anyhow::Result<(
     loop {
         tokio::select! {
             read = sock_r.read(&mut from_remote) => match read {
-                // The shell exited, or the server tore the session down.
                 Ok(0) | Err(_) => {
                     dbg(format!("pump: socket closed ({read:?})"));
                     return Ok(());
@@ -222,8 +192,8 @@ async fn pump_shell(stream: TcpStream, cols: u16, rows: u16) -> anyhow::Result<(
                     let (printable, queries) = filter.feed(&from_remote[..n]);
                     stdout.write_all(&printable).await?;
                     stdout.flush().await?;
-                    // Answer once everything before the query is on screen,
-                    // so the reported position is the one the query meant.
+                    // Answered only once everything before the query is on
+                    // screen, so the reported position is the one it meant.
                     for _ in 0..queries {
                         let (row, col) = crate::console::cursor_position().unwrap_or((1, 1));
                         dbg(format!("pump: answering cursor query with {row};{col}"));
@@ -259,9 +229,9 @@ async fn pump_shell(stream: TcpStream, cols: u16, rows: u16) -> anyhow::Result<(
                         return Ok(());
                     }
                 }
-                // The console only reports focus if the remote asked for it
-                // (its `\e[?1004h` passed through to the local console), so
-                // a report always has a waiting recipient.
+                // Only reported if the remote asked for it (its `\e[?1004h`
+                // passed through to the local console), so it always has a
+                // waiting recipient.
                 Some(Ok(Event::FocusGained)) => {
                     if sock_w.write_all(&term::data_frame(b"\x1b[I")).await.is_err() {
                         return Ok(());
@@ -272,7 +242,6 @@ async fn pump_shell(stream: TcpStream, cols: u16, rows: u16) -> anyhow::Result<(
                         return Ok(());
                     }
                 }
-                // Mouse: nothing on the far side wants it.
                 Some(Ok(other)) => dbg(format!("pump: ignored {other:?}")),
             },
         }
@@ -280,9 +249,8 @@ async fn pump_shell(stream: TcpStream, cols: u16, rows: u16) -> anyhow::Result<(
 }
 
 /// On unix a raw-mode tty hands over the byte stream exactly as a terminal
-/// produced it — arrows, Ctrl+C and all — so bytes are forwarded verbatim
-/// instead of decoding and re-encoding events. Resize has no event here;
-/// the size is polled.
+/// produced it, so bytes are forwarded verbatim instead of decoding and
+/// re-encoding events.
 #[cfg(not(windows))]
 async fn pump_shell(stream: TcpStream, mut cols: u16, mut rows: u16) -> anyhow::Result<()> {
     let (mut sock_r, mut sock_w) = stream.into_split();
@@ -291,11 +259,10 @@ async fn pump_shell(stream: TcpStream, mut cols: u16, mut rows: u16) -> anyhow::
     resize_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut tee = open_tee();
 
-    // Keystrokes come from a plain OS thread, not `tokio::io::stdin()`: a
-    // tty read blocks until the next keypress and cannot be cancelled, and a
-    // tokio blocking task stuck like that keeps the runtime — and therefore
-    // the whole process — alive after the session ends, until one more key is
-    // pressed. A detached thread parked in read(2) just dies with us.
+    // A blocking tty read can't be cancelled, so it runs on a plain OS
+    // thread rather than `tokio::io::stdin()` — a tokio blocking task stuck
+    // there would keep the process alive after the session ends, until one
+    // more key is pressed. A detached thread just dies with us.
     let (key_tx, mut key_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
     std::thread::spawn(move || {
         use std::io::Read;
@@ -303,7 +270,6 @@ async fn pump_shell(stream: TcpStream, mut cols: u16, mut rows: u16) -> anyhow::
         let mut buf = [0u8; 4096];
         loop {
             match stdin.read(&mut buf) {
-                // EOF: stop typing; dropping the sender hangs up the pump.
                 Ok(0) | Err(_) => return,
                 Ok(n) => {
                     if key_tx.blocking_send(buf[..n].to_vec()).is_err() {
@@ -319,7 +285,6 @@ async fn pump_shell(stream: TcpStream, mut cols: u16, mut rows: u16) -> anyhow::
     loop {
         tokio::select! {
             read = sock_r.read(&mut from_remote) => match read {
-                // The shell exited, or the server tore the session down.
                 Ok(0) | Err(_) => return Ok(()),
                 Ok(n) => {
                     if let Some(file) = tee.as_mut() {
@@ -353,9 +318,8 @@ async fn pump_shell(stream: TcpStream, mut cols: u16, mut rows: u16) -> anyhow::
     }
 }
 
-/// One decoded key press → the bytes a terminal would have sent for it
-/// (xterm encoding, which ConPTY on the far side parses). `None` for keys
-/// with no byte representation, like bare modifiers.
+/// The xterm byte sequence for one decoded key press, or `None` for keys
+/// with no representation (bare modifiers).
 #[cfg(windows)]
 fn encode_key(key: &KeyEvent) -> Option<Vec<u8>> {
     use KeyCode::*;
@@ -363,22 +327,19 @@ fn encode_key(key: &KeyEvent) -> Option<Vec<u8>> {
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    // xterm's modifier parameter: 1, plus shift 1 / alt 2 / ctrl 4.
     let m = 1 + shift as u8 + 2 * (alt as u8) + 4 * (ctrl as u8);
 
-    // Cursor-style keys: `\e[A`, with modifiers `\e[1;{m}A`.
     let arrow = |c: u8| if m == 1 {
         vec![0x1b, b'[', c]
     } else {
         format!("\x1b[1;{m}{}", c as char).into_bytes()
     };
-    // Editing keys: `\e[{n}~`, with modifiers `\e[{n};{m}~`.
     let tilde = |n: u8| if m == 1 {
         format!("\x1b[{n}~").into_bytes()
     } else {
         format!("\x1b[{n};{m}~").into_bytes()
     };
-    // Ordinary bytes; Alt is an ESC prefix (Alt+X sends `\ex`).
+    // Alt is an ESC prefix (Alt+X sends `\ex`).
     let plain = |bytes: Vec<u8>| if alt {
         let mut v = Vec::with_capacity(bytes.len() + 1);
         v.push(0x1b);
@@ -412,7 +373,7 @@ fn encode_key(key: &KeyEvent) -> Option<Vec<u8>> {
         Delete => tilde(3),
         PageUp => tilde(5),
         PageDown => tilde(6),
-        // F1–F4 are SS3 when unmodified, CSI like the arrows otherwise.
+        // F1-F4 are SS3 when unmodified, CSI like the arrows otherwise.
         F(n @ 1..=4) if m == 1 => vec![0x1b, b'O', b'P' + n - 1],
         F(n @ 1..=4) => format!("\x1b[1;{m}{}", (b'P' + n - 1) as char).into_bytes(),
         F(5) => tilde(15),
@@ -427,7 +388,6 @@ fn encode_key(key: &KeyEvent) -> Option<Vec<u8>> {
     })
 }
 
-/// The C0 control a terminal sends for Ctrl plus this character, if any.
 #[cfg(windows)]
 fn ctrl_byte(c: char) -> Option<u8> {
     match c {
@@ -444,9 +404,6 @@ fn ctrl_byte(c: char) -> Option<u8> {
     }
 }
 
-// ---- attach ------------------------------------------------------------
-
-/// Restores cooked mode however we leave the attach bridge.
 struct RawMode;
 
 impl RawMode {
@@ -494,8 +451,6 @@ async fn pump_attach(stream: TcpStream) -> anyhow::Result<bool> {
             read = sock_r.read(&mut buf) => match read {
                 Ok(0) | Err(_) => return Ok(true),
                 Ok(n) => {
-                    // Raw mode does not translate: a bare \n would step down
-                    // a row without returning to column 0.
                     stdout.write_all(&crlf(&buf[..n])).await?;
                     stdout.flush().await?;
                 }
@@ -532,12 +487,10 @@ fn edit(line: &mut Vec<char>, key: KeyEvent) -> Option<Edit> {
     match key.code {
         KeyCode::Enter => {
             let text: String = line.drain(..).collect();
-            // cmd.exe and POSIX shells both accept CRLF-terminated lines.
             Some(Edit { echo: "\r\n".to_string(), send: Some(format!("{text}\r\n")) })
         }
         KeyCode::Backspace => {
             line.pop()?;
-            // Erase the glyph, not just the cursor position.
             Some(Edit { echo: "\x08 \x08".to_string(), send: None })
         }
         KeyCode::Tab => {
@@ -557,6 +510,8 @@ fn is_ctrl(key: &KeyEvent, c: char) -> bool {
         && matches!(key.code, KeyCode::Char(got) if got.eq_ignore_ascii_case(&c))
 }
 
+/// Raw mode does not translate: a bare `\n` would step down a row without
+/// returning to column 0.
 fn crlf(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut prev = 0u8;

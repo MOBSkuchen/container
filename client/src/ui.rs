@@ -1,4 +1,4 @@
-//! Rendering. Pure functions of `&App` — no state lives here.
+//! Rendering. Pure functions of `&App`
 
 use std::time::Instant;
 
@@ -213,8 +213,6 @@ fn instance_status(inst: &InstanceStatResponse) -> (&'static str, String, Style)
         RunState::Failed(e) => ("✗", format!("failed: {}", first_line(e)), Style::new().fg(Color::Red)),
     }
 }
-
-// ---- manage screen ----------------------------------------------------
 
 fn draw_manage(frame: &mut Frame, app: &App, manage: &Manage, area: Rect) {
     let [side, main] = Layout::horizontal([Constraint::Length(30), Constraint::Min(20)]).areas(area);
@@ -549,8 +547,6 @@ fn draw_keys(frame: &mut Frame, area: Rect, keys: &[(&str, &str)]) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-// ---- modals -----------------------------------------------------------
-
 fn modal_area(frame: &Frame, width: u16, height: u16) -> Rect {
     let area = frame.area();
     let [area] = Layout::horizontal([Constraint::Length(width.min(area.width))])
@@ -727,8 +723,6 @@ fn draw_help(frame: &mut Frame, app: &App) {
     lines.push(Line::styled("any key closes this", Style::new().fg(DIM)));
     frame.render_widget(Paragraph::new(lines), inner);
 }
-
-// ---- formatting -------------------------------------------------------
 
 pub fn fmt_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];

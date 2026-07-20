@@ -228,8 +228,6 @@ impl ReplayGuard {
     }
 }
 
-// ---- key transport ----------------------------------------------------
-
 pub fn to_hex(key: &[u8]) -> String {
     key.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -250,8 +248,6 @@ pub fn from_hex(text: &str) -> Result<Vec<u8>, String> {
             .map_err(|_| format!("'{}' is not a hex byte", &text[i..i + 2])))
         .collect()
 }
-
-// ---- payload codec ----------------------------------------------------
 
 /// Serialize a wire value to bytes. `Vec<u8>` is an `AsyncWrite`, so this
 /// reuses the same encoding the socket would have seen.

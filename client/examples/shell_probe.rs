@@ -102,8 +102,6 @@ async fn ensure_instance(ep: &Endpoint) {
     }
 }
 
-// ---- the pty session ----------------------------------------------------
-
 struct Session {
     rx: mpsc::Receiver<Vec<u8>>,
     writer: Box<dyn Write + Send>,
@@ -352,8 +350,6 @@ fn probe(client_exe: &PathBuf, book_path: &PathBuf, out_dir: &PathBuf) {
         let _ = child.kill();
     }
     s.drain(Duration::from_millis(300));
-
-    // ---- report ----------------------------------------------------------
 
     let raw = out_dir.join("transcript.raw");
     std::fs::write(&raw, &s.transcript).unwrap();

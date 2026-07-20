@@ -1,12 +1,11 @@
-//! A small modal form: labelled fields, one focused at a time.
+//! A small modal form: labeled fields, one focused at a time.
 //!
-//! Deliberately generic enough for the instance editor (M2), which needs
+//! Deliberately generic enough for the instance editor, which needs
 //! toggles and a retry-policy picker alongside plain text.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 pub enum FieldKind {
-    /// `value` is chars, not bytes, so cursor arithmetic stays trivial.
     Text { value: Vec<char>, cursor: usize },
     Toggle(bool),
     Select { options: Vec<String>, index: usize },
@@ -15,7 +14,6 @@ pub enum FieldKind {
 pub struct Field {
     pub label: String,
     pub kind: FieldKind,
-    /// Shown dimmed beside the field; use it for units, defaults, examples.
     pub hint: Option<String>,
 }
 
@@ -66,7 +64,7 @@ pub struct Form {
     pub title: String,
     pub fields: Vec<Field>,
     pub focus: usize,
-    /// Validation message from a rejected submit, cleared on the next edit.
+    /// Validation message from a rejected submit, cleared on the next edit
     pub error: Option<String>,
 }
 

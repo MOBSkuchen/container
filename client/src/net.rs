@@ -1,9 +1,4 @@
 //! RPC helpers.
-//!
-//! bierpc serves exactly one action per connection, so every call dials a
-//! fresh `RpcClient`. Its `RpcError` carries no detail (it is a unit variant),
-//! so the useful distinction — "server not running" vs "died mid-request" —
-//! has to come from *which* step failed, and is reconstructed here.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -19,15 +14,15 @@ pub const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub enum NetError {
-    /// Could not get a connection at all.
+    /// Could not get a connection at all
     Unreachable(String),
-    /// Connected, but the exchange did not complete or made no sense.
+    /// Connected, but the exchange did not complete or made no sense
     Protocol(String),
-    /// The key was refused, or the reply could not be authenticated.
+    /// The key was refused, or the reply could not be authenticated
     Auth(AuthFailure),
-    /// No key configured for this server yet.
+    /// No key configured for this server yet
     NoKey,
-    /// The server answered, and the answer was a refusal.
+    /// The server refused
     Api(ApiError),
 }
 
@@ -61,9 +56,6 @@ impl NetError {
 }
 
 /// One authenticated round trip: sign the action, dial, verify the reply.
-///
-/// Both directions are MAC'd, and the reply is signed against the nonce we
-/// sent, so a reply cannot be lifted from another exchange.
 pub async fn call_with_key(addr: SocketAddr, key: &[u8], action: Action) -> Result<Response, NetError> {
     if key.len() != auth::KEY_LEN {
         return Err(NetError::NoKey);
@@ -117,7 +109,7 @@ fn unexpected(what: &str, got: Response) -> NetError {
     NetError::Protocol(format!("expected {what}, got {got:?}"))
 }
 
-/// Raw counters and the instance list from one `Stat`.
+/// Raw counters
 #[derive(Debug, Clone)]
 pub struct Vitals {
     pub total_stg: u64,
@@ -150,6 +142,7 @@ fn sorted_by_name(instances: HashMap<u128, InstanceStatResponse>) -> Vec<Instanc
     list
 }
 
+/// Ancient artifact
 pub async fn ping(endpoint: &Endpoint) -> Result<(), NetError> {
     match call(endpoint, Action::Ping).await? {
         Response::Pong => Ok(()),
@@ -164,7 +157,7 @@ pub async fn check(endpoint: &Endpoint, id: u128) -> Result<InstanceStatus, NetE
     }
 }
 
-/// Recent console output for an instance, oldest first.
+/// Recent console output for an instance, oldest first
 pub async fn tail_console(endpoint: &Endpoint, id: u128, lines: u32) -> Result<(Vec<ConsoleLine>, u64), NetError> {
     match call(endpoint, Action::TailConsole { id, lines }).await? {
         Response::Console { lines, dropped } => Ok((lines, dropped)),
@@ -189,7 +182,7 @@ pub async fn create(endpoint: &Endpoint, spec: crate::instance_form::Parsed) -> 
     }
 }
 
-/// For actions whose only interesting outcome is success or failure.
+/// For actions whose only interesting outcome is success or failure
 pub async fn done(endpoint: &Endpoint, action: Action) -> Result<(), NetError> {
     match call(endpoint, action).await? {
         Response::Done => Ok(()),

@@ -1,5 +1,5 @@
 //! The create/edit instance form: field layout, and the parsing that turns
-//! flat text back into an `InstanceConfig`'s worth of typed values.
+//! flat text back into an `InstanceConfig`'s worth of typed values
 
 use std::collections::HashMap;
 
@@ -52,7 +52,7 @@ pub fn build(existing: Option<&InstanceConfig>) -> Form {
     Form::new(title, fields)
 }
 
-/// Everything the form yields, validated. Field order matches `Action`'s.
+/// Everything the form yields, validated. Field order matches `Action`'s
 pub struct Parsed {
     pub name: String,
     pub repo_url: String,
@@ -111,7 +111,7 @@ pub fn parse(form: &Form) -> Result<Parsed, String> {
     })
 }
 
-/// Split on whitespace, but keep `"quoted runs"` together.
+/// CL-style argument parsing
 pub fn parse_args(text: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
@@ -162,7 +162,7 @@ fn parse_env(text: &str) -> Result<HashMap<String, String>, String> {
     Ok(env)
 }
 
-/// Sorted, so editing an instance twice does not shuffle the field.
+/// Sorted, so editing an instance twice does not shuffle the field
 pub fn fmt_env(env: &HashMap<String, String>) -> String {
     let mut pairs: Vec<_> = env.iter().collect();
     pairs.sort_by(|a, b| a.0.cmp(b.0));

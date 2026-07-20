@@ -1,6 +1,4 @@
-//! The client's persistent state: which servers it knows, and the keys it
-//! talks to them with. Instances are never cached; they come from the servers
-//! live.
+//! Persistent storage for the client
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -11,13 +9,11 @@ use tokio::fs;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ServerEntry {
-    /// Stable local identity. Snapshots are keyed by this rather than by list
-    /// position, so removing a server can never misattribute another's data.
+    /// local identity
     pub id: u128,
     pub name: String,
     pub addr: SocketAddr,
-    /// Per-server key. Empty means "use the book's default key", which is the
-    /// common case: one phrase shared across a fleet.
+    /// Per-server key. When empty, the default key is used.
     pub key: Vec<u8>,
 }
 
@@ -29,7 +25,7 @@ impl ServerEntry {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Book {
-    /// Used for any server without a key of its own.
+    /// Default key
     pub key: Vec<u8>,
     pub servers: Vec<ServerEntry>,
 }
@@ -48,8 +44,7 @@ impl Book {
         self.key_for(entry).map(|key| crate::net::Endpoint::new(entry.addr, key.to_vec()))
     }
 
-    /// Same, but never fails: an endpoint with an empty key produces a clear
-    /// `NetError::NoKey` at call time rather than silently skipping the server.
+    /// Same, but never fails: an empty key defers to `NoKey` at call time
     pub fn endpoint_or_keyless(&self, entry: &ServerEntry) -> crate::net::Endpoint {
         self.endpoint_for(entry)
             .unwrap_or_else(|| crate::net::Endpoint::new(entry.addr, Vec::new()))
@@ -64,13 +59,13 @@ impl Book {
     }
 }
 
-/// Default location, overridable with `-c`.
+/// Default config location
 pub fn default_path() -> PathBuf {
     let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
     base.join("container-client").join("servers.chld")
 }
 
-/// Missing file = empty book; that is the first-run case, not an error.
+/// Missing file = empty book; first run.
 pub async fn load(path: &Path) -> anyhow::Result<Book> {
     if !path.exists() {
         return Ok(Book::default());
@@ -79,7 +74,7 @@ pub async fn load(path: &Path) -> anyhow::Result<Book> {
     Ok(Book::deserialize(&mut f).await?)
 }
 
-/// Write via a temp file so an interrupted save cannot truncate the book.
+/// Save book via tmp file to avoid corruption.
 pub async fn save(path: &Path, book: &Book) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;

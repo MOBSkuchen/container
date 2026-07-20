@@ -9,17 +9,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
-// The two bridges are deliberately different:
-//
 // `attach_bridge` speaks plain bytes to the *supervised* process, which
-// processkit runs on pipes — so its output is line-wise. Fine for CLIs and
-// REPLs, not for full-screen programs.
-//
-// `shell_bridge` runs its own shell under a real PTY and is a raw byte
-// conduit, so it behaves like an ordinary terminal.
+// processkit runs on pipes, so it's line-wise — fine for CLIs, not
+// full-screen programs. `shell_bridge` runs its own shell under a real PTY
+// instead and is a raw byte conduit.
 
 /// `docker attach`-style: bridge the socket to an already-running instance.
-/// Ends when the client disconnects or the process exits.
 pub async fn attach_bridge(
     stream: TcpStream,
     mut output_rx: broadcast::Receiver<Vec<u8>>,
@@ -61,13 +56,8 @@ pub async fn attach_bridge(
 
 /// `docker exec`-style: a fresh shell in the instance's repo dir, run under a
 /// real PTY (ConPTY on Windows) and bridged to the socket as raw bytes.
-///
-/// The PTY is what makes this feel like a terminal rather than a pipe: the
-/// shell echoes, line-edits and emits escape sequences itself, and full-screen
-/// programs work. processkit is pipe-based, so this path does not use it.
-///
-/// Client → server is framed (keystrokes and window resizes, see
-/// `protocol::term`); server → client is the terminal's raw output.
+/// Client → server is framed (`protocol::term`, for resize messages);
+/// server → client is the terminal's raw output.
 pub async fn shell_bridge(stream: TcpStream, shell: String, cwd: PathBuf, cols: u16, rows: u16) {
     let (mut sock_r, mut sock_w) = stream.into_split();
 

@@ -52,7 +52,7 @@ pub struct ServerState {
     pub rate_recv: f64,
     pub rate_trans: f64,
     pub collapsed: bool,
-    /// Previous counters, for turning monotonic totals into rates.
+    /// Previous counters, for turning monotonic totals into rates
     prev_net: Option<(u64, u64, Instant)>,
 }
 
@@ -101,14 +101,14 @@ impl ServerState {
     }
 }
 
-/// A row of the landing page's flattened server/instance tree.
+/// A row of the landing page's flattened server/instance tree
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Row {
     Server { server: usize },
     Instance { server: usize, instance: usize },
 }
 
-/// Screens form a stack; `Esc` pops. Only the top one draws and takes keys.
+/// Screens form a stack; `Esc` pops. Only the top one draws and takes keys
 pub enum Screen {
     Landing,
     Manage(Manage),
@@ -120,10 +120,10 @@ pub struct Manage {
     pub detail: Option<InstanceStatus>,
     pub detail_error: Option<String>,
     pub console: Vec<ConsoleLine>,
-    /// Lines the server has already discarded from its ring buffer.
+    /// Lines the server has already discarded from its ring buffer
     pub console_dropped: u64,
     pub console_error: Option<String>,
-    /// Lines scrolled back from the bottom. 0 = following the newest output.
+    /// Lines scrolled back from the bottom. 0 = following the newest output
     pub console_scroll: usize,
 }
 
@@ -215,8 +215,6 @@ impl App {
         &self.book.servers
     }
 
-    // ---- derived view -------------------------------------------------
-
     pub fn screen(&self) -> &Screen {
         self.screens.last().expect("the screen stack is never empty")
     }
@@ -273,8 +271,6 @@ impl App {
             .unwrap_or(&[])
     }
 
-    // ---- feedback -----------------------------------------------------
-
     pub fn info(&mut self, text: impl Into<String>) {
         self.toast = Some(Toast { text: text.into(), kind: ToastKind::Info, until: Instant::now() + TOAST_TTL });
     }
@@ -282,8 +278,6 @@ impl App {
     pub fn error(&mut self, text: impl Into<String>) {
         self.toast = Some(Toast { text: text.into(), kind: ToastKind::Error, until: Instant::now() + TOAST_TTL });
     }
-
-    // ---- mutations ----------------------------------------------------
 
     fn publish_servers(&mut self) {
         let _ = self.book_tx.send(self.book.clone());
@@ -365,8 +359,6 @@ impl App {
         }
     }
 
-    // ---- events -------------------------------------------------------
-
     pub fn on_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::Snapshot { server, result } => {
@@ -437,8 +429,6 @@ impl App {
             self.fetch_detail(managed_server, managed_instance);
         }
     }
-
-    // ---- input --------------------------------------------------------
 
     pub fn on_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
@@ -537,7 +527,7 @@ impl App {
         }
     }
 
-    /// Positive scrolls back into history; `isize::MIN` returns to following.
+    /// Positive scrolls back into history; `isize::MIN` returns to following
     fn scroll_console(&mut self, delta: isize) {
         let Some(Screen::Manage(m)) = self.screens.last_mut() else { return };
         let max = m.console.len();
@@ -784,8 +774,6 @@ impl App {
         }
     }
 
-    // ---- loop ---------------------------------------------------------
-
     /// Generic over backend and input source so a headless driver can supply
     /// a `TestBackend` and a scripted key stream.
     pub async fn run<B, I>(
@@ -828,10 +816,7 @@ impl App {
     }
 }
 
-/// Poll every known server on an interval, or immediately when nudged.
-///
-/// One in-flight request per server: a server that is timing out must not
-/// accumulate a backlog of pending polls.
+/// Poll every known server on an interval, or immediately when nudged
 pub fn spawn_poller(
     mut book_rx: watch::Receiver<Book>,
     events_tx: mpsc::Sender<AppEvent>,

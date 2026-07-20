@@ -48,8 +48,7 @@ pub async fn resolve(book: &Book, spec: &str) -> anyhow::Result<Resolved> {
     }
 }
 
-/// Search every server. Unreachable ones are skipped rather than fatal — one
-/// server being down should not stop you attaching to another.
+/// Search across every server
 async fn resolve_bare(book: &Book, spec: &str) -> anyhow::Result<Resolved> {
     let mut hits = Vec::new();
     let mut failures = Vec::new();
