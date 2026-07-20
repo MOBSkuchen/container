@@ -1,0 +1,25 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+protocol = { path = "../protocol" }
+bier_derive = { path = "../../rpc/bier_derive" }
+bierpc = { path = "../../rpc/bierpc" }
+anyhow = "1.0.103"
+tokio = { version = "1.52.3", features = ["full"] }
+clap = { version = "4.6.1", features = ["derive"] }
+dirs = "6.0.0"
+ratatui = "0.30.2"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+futures = "0.3.33"
+rand = "0.10.2"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console", "Win32_Foundation"] }
+
+[dev-dependencies]
+# The shell_probe example runs the built client under a ConPTY so the real
+# console code paths (RawConsole, ReadConsoleW/WriteConsoleW) are exercised.
+portable-pty = "0.9.0"
