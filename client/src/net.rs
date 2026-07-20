@@ -35,7 +35,7 @@ impl std::fmt::Display for NetError {
                 "no authentication key for this server — run `client keygen <phrase>` \
                  with the phrase the server was given",
             ),
-            NetError::Api(e) => write!(f, "{:?}: {}", e.code, e.msg),
+            NetError::Api(e) => write!(f, "{e}"),
         }
     }
 }
