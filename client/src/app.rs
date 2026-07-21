@@ -610,6 +610,7 @@ impl App {
                 }
             }
             KeyCode::Char('d') => self.confirm_remove_server(),
+            KeyCode::Char('B') => self.request_bootstrap(),
             KeyCode::Char('r') => {
                 self.refresh.notify_one();
                 self.info("refreshing");
@@ -996,28 +997,42 @@ impl App {
             .unwrap_or_else(|| format!("{instance:032x}"))
     }
 
-    /// Offer bootstrapping once for a freshly added server that supports it.
-    /// Waits its turn if a modal is already up — the offer keeps until then.
+    /// Point out bootstrapping once for a freshly added server that supports
+    /// it. A toast, deliberately not a modal: a dialog popping up on a poll
+    /// event could swallow a keypress meant for the tree.
     fn offer_bootstrap(&mut self, server: u128) {
         if !self.bootstrap_offers.contains(&server) {
             return;
         }
         let Some(vitals) = self.states.get(&server).and_then(|s| s.vitals.as_ref()) else { return };
-        if !vitals.bootstrap {
-            self.bootstrap_offers.remove(&server);
-            return;
-        }
-        if self.modal.is_some() {
-            return;
-        }
         self.bootstrap_offers.remove(&server);
-        let name = self.entry(server).map(|e| e.name.clone()).unwrap_or_default();
+        if vitals.bootstrap {
+            let name = self.entry(server).map(|e| e.name.clone()).unwrap_or_default();
+            self.info(format!("'{name}' supports bootstrapping — press B on it to set that up"));
+        }
+    }
+
+    /// `B` on the landing screen: confirm-and-bootstrap the selected server.
+    fn request_bootstrap(&mut self) {
+        let Some(idx) = self.selected_server() else {
+            self.error("nothing selected");
+            return;
+        };
+        let entry = &self.book.servers[idx];
+        let (server, name) = (entry.id, entry.name.clone());
+        let available = self.states.get(&server)
+            .and_then(|s| s.vitals.as_ref())
+            .is_some_and(|v| v.bootstrap);
+        if !available {
+            self.error(format!("'{name}' does not offer bootstrapping (not enabled, already done, or unreachable)"));
+            return;
+        }
         self.modal = Some(Modal::Confirm {
             title: "Bootstrap server".to_string(),
             message: format!(
-                "'{name}' supports bootstrapping: it can hand itself over and run \
-                 as an instance under its own management.\n\
-                 The server restarts once, then appears in its own instance list.",
+                "Hand '{name}' over to itself?\n\
+                 It records itself as an instance, restarts once, and then \
+                 appears in its own instance list.",
             ),
             toggle: None,
             pending: Pending::Bootstrap(server),

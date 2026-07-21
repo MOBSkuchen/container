@@ -831,6 +831,7 @@ fn draw_help(frame: &mut Frame, app: &App) {
             ("n", "create an instance on the selected server"),
             ("e", "edit the selected server"),
             ("d", "remove the selected server from this client"),
+            ("B", "bootstrap the selected server (when it offers it)"),
             ("r", "poll every server now"),
             ("q / esc", "quit"),
         ],
