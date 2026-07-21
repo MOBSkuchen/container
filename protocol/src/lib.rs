@@ -18,5 +18,5 @@ pub use api::{Action, ApiError, DirEntry, ErrorCode, Response, TerminalMode};
 pub use auth::{AuthFailure, Reply, Request};
 pub use instance::{
     ConsoleLine, GroupStats, InstanceConfig, InstanceStatResponse, InstanceStatus, RepoState,
-    RetryPolicy, RunState, Stream,
+    RetryPolicy, RunState, Source, Stream,
 };

@@ -4,5 +4,6 @@ pub mod storage;
 pub mod manager;
 pub mod gitops;
 pub mod session;
+pub mod sourceops;
 pub mod terminal;
 pub mod transfer;

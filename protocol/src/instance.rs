@@ -51,14 +51,30 @@ pub struct GroupStats {
     pub peak_memory_bytes: Option<u64>,
 }
 
-/// Full definition of an instance: a public git repo plus how to run it.
+/// Where an instance's checkout comes from.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum Source {
+    /// Clone a public git repo, optionally a specific branch.
+    Git { url: String, branch: Option::<String> },
+    /// Download from a URL. Archives (.tar.gz/.tgz/.tar/.zip) are unpacked;
+    /// anything else lands as a single file named after the URL's last
+    /// segment.
+    Url { url: String },
+    /// The client pushes the content (a directory, archive or plain file)
+    /// over an `UploadSource` session. `desc` records what was pushed, for
+    /// display only.
+    Upload { desc: String },
+    /// Nothing to materialize; used by the self-managed server entry.
+    None,
+}
+
+/// Full definition of an instance: a source plus how to run it.
 /// This is what the server persists to its instance index.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct InstanceConfig {
     pub id: u128,
     pub name: String,
-    pub repo_url: String,
-    pub branch: Option<String>,
+    pub source: Source,
     pub command: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,

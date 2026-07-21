@@ -180,8 +180,38 @@ impl Api {
 
     async fn upload_archive(&self, dest: PathBuf) -> Result<Response, ApiError> {
         let dir = transfer::resolve_path(&self.stg, &dest)?;
-        let offer = session::open(self.session_ttl(), move |stream| {
-            transfer::receive_archive(stream, dir)
+        let offer = session::open(self.session_ttl(), move |stream| async move {
+            let _ = transfer::receive_archive(stream, dir).await;
+        }).await.map_err(|e| ApiError {
+            code: ErrorCode::Internal,
+            msg: format!("opening session listener: {e}"),
+        })?;
+
+        Ok(Response::SessionOpened {
+            port: offer.port,
+            token: offer.token,
+            ttl_secs: offer.ttl_secs,
+            size: None,
+        })
+    }
+
+    /// Content push for an Upload-source instance. The instance flips to
+    /// Provisioning only once the client actually connects, so an unused
+    /// offer leaves it untouched.
+    async fn upload_source(&self, id: u128) -> Result<Response, ApiError> {
+        self.manager.begin_source_upload(id, false).await?;
+        let manager = self.manager.clone();
+        let offer = session::open(self.session_ttl(), move |stream| async move {
+            let dir = match manager.begin_source_upload(id, true).await {
+                Ok(dir) => dir,
+                Err(e) => {
+                    eprintln!("source upload for {id:032x} refused at connect time: {}", e.msg);
+                    return;
+                }
+            };
+            let result = transfer::receive_archive(stream, dir).await
+                .map_err(|e| e.to_string());
+            manager.finish_source_upload(id, result).await;
         }).await.map_err(|e| ApiError {
             code: ErrorCode::Internal,
             msg: format!("opening session listener: {e}"),
@@ -254,19 +284,20 @@ impl Api {
         match action {
             Action::Ping => self.ping().await,
             Action::Stat => self.stat().await,
-            Action::CreateInstance { name, repo_url, branch, command, args, env, autostart, retry_policy } => {
+            Action::CreateInstance { name, source, command, args, env, autostart, retry_policy } => {
                 let config = InstanceConfig {
                     id: 0, // assigned by the manager
-                    name, repo_url, branch, command, args, env, autostart, retry_policy,
+                    name, source, command, args, env, autostart, retry_policy,
                     self_managed: false,
                 };
                 respond(self.manager.create(config).await.map(|id| Response::InstanceCreated { id }))
             }
-            Action::UpdateInstance { id, name, repo_url, branch, command, args, env, autostart, retry_policy } => {
-                let patch = InstancePatch { name, repo_url, branch, command, args, env, autostart, retry_policy };
+            Action::UpdateInstance { id, name, source, command, args, env, autostart, retry_policy } => {
+                let patch = InstancePatch { name, source, command, args, env, autostart, retry_policy };
                 respond(self.manager.update_config(id, patch).await.map(|_| Response::Done))
             }
             Action::UpdateRepo { id } => respond(self.manager.update_repo(id).await.map(|_| Response::Done)),
+            Action::UploadSource { id } => respond(self.upload_source(id).await),
             Action::RunInstance { id } => respond(self.manager.run(id).await.map(|_| Response::Done)),
             Action::StopInstance { id } => respond(self.manager.stop(id).await.map(|_| Response::Done)),
             Action::KillInstance { id } => respond(self.manager.kill(id).await.map(|_| Response::Done)),

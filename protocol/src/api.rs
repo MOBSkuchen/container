@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use bier_derive::{Deserialize, Serialize};
 use bierpc::serialize::{Deserialize, Serialize};
-use crate::instance::{ConsoleLine, InstanceStatResponse, InstanceStatus, RetryPolicy};
+use crate::instance::{ConsoleLine, InstanceStatResponse, InstanceStatus, RetryPolicy, Source};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 pub enum ErrorCode {
@@ -57,8 +57,7 @@ pub enum Action {
     Stat,
     CreateInstance {
         name: String,
-        repo_url: String,
-        branch: Option::<String>,
+        source: Source,
         command: String,
         args: Vec::<String>,
         env: HashMap::<String, String>,
@@ -68,16 +67,20 @@ pub enum Action {
     UpdateInstance {
         id: u128,
         name: Option::<String>,
-        repo_url: Option::<String>,
-        branch: Option::<Option<String>>,
+        source: Option::<Source>,
         command: Option::<String>,
         args: Option::<Vec<String>>,
         env: Option::<HashMap<String, String>>,
         autostart: Option::<bool>,
         retry_policy: Option::<RetryPolicy>,
     },
-    /// Re-clone the configured branch and swap it in (instance must be stopped).
+    /// Re-materialize the source and swap it in (instance must be stopped).
+    /// Upload sources are refreshed with `UploadSource` instead.
     UpdateRepo { id: u128 },
+    /// Client will push a tar.gz of an Upload instance's content over the
+    /// returned session; the server unpacks it into the instance's repo dir
+    /// and marks the instance ready. The instance must be stopped.
+    UploadSource { id: u128 },
     RunInstance { id: u128 },
     /// Graceful stop (terminate → grace → kill on Unix; job terminate on Windows).
     StopInstance { id: u128 },

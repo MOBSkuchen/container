@@ -158,7 +158,7 @@ fn tmp_archive_path() -> PathBuf {
 
 /// Session handler: receive a tar.gz and unpack it into `dest`, acking only
 /// after the unpack so the client knows the files exist, not just the bytes.
-pub async fn receive_archive(mut stream: TcpStream, dest: PathBuf) {
+pub async fn receive_archive(mut stream: TcpStream, dest: PathBuf) -> std::io::Result<()> {
     let tmp = tmp_archive_path();
     let result = async {
         fs::create_dir_all(&dest).await?;
@@ -174,8 +174,12 @@ pub async fn receive_archive(mut stream: TcpStream, dest: PathBuf) {
         Ok(()) => {
             let _ = stream.write_all(&[1u8]).await;
             let _ = stream.shutdown().await;
+            Ok(())
         }
-        Err(e) => eprintln!("archive upload into '{}' failed: {e}", dest.display()),
+        Err(e) => {
+            eprintln!("archive upload into '{}' failed: {e}", dest.display());
+            Err(e)
+        }
     }
 }
 

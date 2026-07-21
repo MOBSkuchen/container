@@ -18,7 +18,7 @@ use tokio::net::TcpStream;
 use protocol::{auth, term};
 use protocol::{AuthFailure, Reply, Request};
 use server::api::{Action, ErrorCode, Response, TerminalMode};
-use server::manager::{RepoState, RetryPolicy, RunState};
+use server::manager::{RepoState, RetryPolicy, RunState, Source};
 
 /// The shared key both ends are set up with; see `main`.
 const PHRASE: &str = "smoke-test-passphrase";
@@ -395,8 +395,7 @@ async fn run_full(addr: SocketAddr) {
     //    we can exercise the attach terminal.
     let id = match call(addr, Action::CreateInstance {
         name: NAME.to_string(),
-        repo_url: "https://github.com/octocat/Hello-World".to_string(),
-        branch: None,
+        source: Source::Git { url: "https://github.com/octocat/Hello-World".to_string(), branch: None },
         command: "cmd.exe".to_string(),
         args: vec!["/q".to_string(), "/k".to_string(), "echo instance-started".to_string()],
         env: HashMap::from([("SMOKE_MARKER".to_string(), "1".to_string())]),
@@ -410,8 +409,7 @@ async fn run_full(addr: SocketAddr) {
     // Duplicate names must be rejected.
     let dup = call(addr, Action::CreateInstance {
         name: NAME.to_string(),
-        repo_url: "https://example.invalid/x".to_string(),
-        branch: None,
+        source: Source::Git { url: "https://example.invalid/x".to_string(), branch: None },
         command: "x".to_string(),
         args: vec![],
         env: HashMap::new(),
@@ -665,6 +663,73 @@ async fn run_full(addr: SocketAddr) {
     let _ = std::fs::remove_dir_all(&tree);
     let _ = std::fs::remove_dir_all(&unpacked);
 
+    // 6d. Alternate sources: a URL download, and content pushed by the client.
+    let url_id = match call(addr, Action::CreateInstance {
+        name: "smoke-url".to_string(),
+        source: Source::Url {
+            url: "https://raw.githubusercontent.com/octocat/Hello-World/master/README".to_string(),
+        },
+        command: "cmd.exe".to_string(),
+        args: vec!["/c".to_string(), "type".to_string(), "README".to_string()],
+        env: HashMap::new(),
+        autostart: false,
+        retry_policy: RetryPolicy::Never,
+    }).await {
+        Response::InstanceCreated { id } => id,
+        other => panic!("url create failed: {other:?}"),
+    };
+    wait_repo_ready(addr, url_id).await;
+    match call(addr, Action::ListDir { path: PathBuf::from(format!("instances/{url_id:032x}/repo")) }).await {
+        Response::DirListing { entries, .. } => {
+            assert!(entries.iter().any(|e| e.name == "README" && !e.is_dir), "downloaded file missing");
+        }
+        other => panic!("url repo not listable: {other:?}"),
+    }
+    println!("OK   url source (plain file downloaded)");
+    match call(addr, Action::RemoveInstance { id: url_id, delete_files: true }).await {
+        Response::Done => {}
+        other => panic!("url cleanup failed: {other:?}"),
+    }
+
+    let up_id = match call(addr, Action::CreateInstance {
+        name: "smoke-uploaded".to_string(),
+        source: Source::Upload { desc: "smoke-tree".to_string() },
+        command: "cmd.exe".to_string(),
+        args: vec!["/c".to_string(), "dir".to_string()],
+        env: HashMap::new(),
+        autostart: false,
+        retry_policy: RetryPolicy::Never,
+    }).await {
+        Response::InstanceCreated { id } => id,
+        other => panic!("upload create failed: {other:?}"),
+    };
+    expect_err(&call(addr, Action::RunInstance { id: up_id }).await,
+        ErrorCode::Provisioning, "run before the content arrived");
+    expect_err(&call(addr, Action::UpdateRepo { id: up_id }).await,
+        ErrorCode::Conflict, "update-repo on an upload source");
+
+    let resp = call(addr, Action::UploadSource { id: up_id }).await;
+    let (mut push, _) = open_session(addr, resp).await;
+    push.write_all(&(tarball.len() as u64).to_be_bytes()).await.unwrap();
+    push.write_all(&tarball).await.unwrap();
+    let mut ack = [0u8; 1];
+    push.read_exact(&mut ack).await.expect("no source unpack ack");
+    assert_eq!(ack[0], 1);
+    wait_repo_ready(addr, up_id).await;
+    match call(addr, Action::ListDir {
+        path: PathBuf::from(format!("instances/{up_id:032x}/repo/smoke-tree")),
+    }).await {
+        Response::DirListing { entries, .. } => {
+            assert!(entries.iter().any(|e| e.name == "a.txt"), "pushed content missing");
+        }
+        other => panic!("pushed content not listable: {other:?}"),
+    }
+    println!("OK   upload source (content pushed and ready)");
+    match call(addr, Action::RemoveInstance { id: up_id, delete_files: true }).await {
+        Response::Done => {}
+        other => panic!("upload cleanup failed: {other:?}"),
+    }
+
     // 7. Update config + repo, then autostart prep for phase2.
     match call(addr, Action::StopInstance { id }).await {
         Response::Done => println!("OK   stop"),
@@ -689,8 +754,7 @@ async fn run_full(addr: SocketAddr) {
     match call(addr, Action::UpdateInstance {
         id,
         name: None,
-        repo_url: None,
-        branch: None,
+        source: None,
         command: None,
         args: None,
         env: None,

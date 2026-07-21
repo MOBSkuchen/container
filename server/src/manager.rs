@@ -7,14 +7,14 @@ use processkit::{CancellationToken, Command, LineTerminator, Outcome, OutputEven
 use tokio::sync::{broadcast, watch, Mutex};
 use tokio::task::JoinHandle;
 use crate::api::{ApiError, ErrorCode};
-use crate::gitops;
+use crate::sourceops;
 use crate::storage::{ServerStg, InstanceConfig};
 
 // Wire types come from the shared `protocol` crate; only the types that touch
 // processkit (`State`) or the manager's internals stay here.
 pub use protocol::instance::{
     ConsoleLine, GroupStats, InstanceStatResponse, InstanceStatus, RepoState, RetryPolicy,
-    RunState, Stream,
+    RunState, Source, Stream,
 };
 
 /// How many console lines are kept per instance. Bounded because an instance
@@ -162,8 +162,7 @@ impl ManagedInstance {
 /// Fields of `Action::UpdateInstance` that may be patched; `None` = unchanged.
 pub struct InstancePatch {
     pub name: Option<String>,
-    pub repo_url: Option<String>,
-    pub branch: Option<Option<String>>,
+    pub source: Option<Source>,
     pub command: Option<String>,
     pub args: Option<Vec<String>>,
     pub env: Option<HashMap<String, String>>,
@@ -223,6 +222,9 @@ impl InstanceManager {
         config.id = rand::random::<u128>();
         let id = config.id;
 
+        // Upload sources also start Provisioning: they are "being prepared"
+        // until the client's push lands.
+        let fetch = matches!(config.source, Source::Git { .. } | Source::Url { .. });
         {
             let mut instances = self.instances.lock().await;
             if instances.values().any(|mi| mi.config.name == config.name) {
@@ -234,31 +236,33 @@ impl InstanceManager {
             self.persist(&instances).await?;
         }
 
-        self.spawn_clone(id, false);
+        if fetch {
+            self.spawn_fetch(id, false);
+        }
         Ok(id)
     }
 
-    /// Background clone/update; flips the instance's `RepoState` when done.
-    fn spawn_clone(self: &Arc<Self>, id: u128, is_update: bool) {
+    /// Background fetch of the source; flips the `RepoState` when done.
+    fn spawn_fetch(self: &Arc<Self>, id: u128, is_update: bool) {
         let mgr = self.clone();
         tokio::spawn(async move {
-            let (url, branch) = {
+            let source = {
                 let instances = mgr.instances.lock().await;
                 let Some(mi) = instances.get(&id) else { return };
-                (mi.config.repo_url.clone(), mi.config.branch.clone())
+                mi.config.source.clone()
             };
             let repo_dir = mgr.stg.repo_dir(id);
             let result = if is_update {
-                gitops::update(url, branch, repo_dir).await
+                sourceops::update(&source, repo_dir).await
             } else {
-                gitops::clone(url, branch, repo_dir).await
+                sourceops::materialize(&source, repo_dir).await
             };
             let mut instances = mgr.instances.lock().await;
             if let Some(mi) = instances.get_mut(&id) {
                 mi.repo = match result {
                     Ok(()) => RepoState::Ready,
                     Err(e) => {
-                        eprintln!("instance {id:032x}: clone/update failed: {e}");
+                        eprintln!("instance {id:032x}: fetching the source failed: {e}");
                         RepoState::CloneFailed(e)
                     }
                 };
@@ -277,8 +281,7 @@ impl InstanceManager {
 
         let c = &mut mi.config;
         if let Some(v) = patch.name { c.name = v; }
-        if let Some(v) = patch.repo_url { c.repo_url = v; }
-        if let Some(v) = patch.branch { c.branch = v; }
+        if let Some(v) = patch.source { c.source = v; }
         if let Some(v) = patch.command { c.command = v; }
         if let Some(v) = patch.args { c.args = v; }
         if let Some(v) = patch.env { c.env = v; }
@@ -288,23 +291,61 @@ impl InstanceManager {
         self.persist(&instances).await
     }
 
-    /// Re-clone the configured branch and swap it in. The instance must not be
-    /// running (on Windows the old tree can't be deleted under a live process).
+    /// Re-fetch the source and swap it in. The instance must not be running
+    /// (on Windows the old tree can't be deleted under a live process).
     pub async fn update_repo(self: &Arc<Self>, id: u128) -> Result<(), ApiError> {
         {
             let mut instances = self.instances.lock().await;
             let mi = instances.get_mut(&id).ok_or_else(|| err(ErrorCode::NotFound, "no such instance"))?;
             mi.ensure_not_self()?;
+            if matches!(mi.config.source, Source::Upload { .. }) {
+                return Err(err(
+                    ErrorCode::Conflict,
+                    "this instance's content is uploaded from a client — push new files instead",
+                ));
+            }
             if mi.is_active() {
                 return Err(err(ErrorCode::Conflict, "instance is running; stop it before updating the repo"));
             }
             if matches!(mi.repo, RepoState::Provisioning) {
-                return Err(err(ErrorCode::Provisioning, "a clone/update is already in progress"));
+                return Err(err(ErrorCode::Provisioning, "a fetch is already in progress"));
             }
             mi.repo = RepoState::Provisioning;
         }
-        self.spawn_clone(id, true);
+        self.spawn_fetch(id, true);
         Ok(())
+    }
+
+    /// Gate for a source upload: the instance must take uploads and not be
+    /// running. Called again by the session once the client connects; that
+    /// second call flips the state to Provisioning and hands out the dir.
+    pub async fn begin_source_upload(&self, id: u128, commit: bool) -> Result<PathBuf, ApiError> {
+        let mut instances = self.instances.lock().await;
+        let mi = instances.get_mut(&id).ok_or_else(|| err(ErrorCode::NotFound, "no such instance"))?;
+        mi.ensure_not_self()?;
+        if !matches!(mi.config.source, Source::Upload { .. }) {
+            return Err(err(ErrorCode::Conflict, "this instance's content is not uploaded — use UpdateRepo"));
+        }
+        if mi.is_active() {
+            return Err(err(ErrorCode::Conflict, "instance is running; stop it before replacing its files"));
+        }
+        if commit {
+            mi.repo = RepoState::Provisioning;
+        }
+        Ok(self.stg.repo_dir(id))
+    }
+
+    pub async fn finish_source_upload(&self, id: u128, result: Result<(), String>) {
+        let mut instances = self.instances.lock().await;
+        if let Some(mi) = instances.get_mut(&id) {
+            mi.repo = match result {
+                Ok(()) => RepoState::Ready,
+                Err(e) => {
+                    eprintln!("instance {id:032x}: source upload failed: {e}");
+                    RepoState::CloneFailed(e)
+                }
+            };
+        }
     }
 
     pub async fn run(self: &Arc<Self>, id: u128) -> Result<(), ApiError> {
@@ -313,8 +354,8 @@ impl InstanceManager {
         mi.ensure_not_self()?;
 
         match &mi.repo {
-            RepoState::Provisioning => return Err(err(ErrorCode::Provisioning, "repo clone still in progress")),
-            RepoState::CloneFailed(e) => return Err(err(ErrorCode::GitError, format!("repo is not available: {e}"))),
+            RepoState::Provisioning => return Err(err(ErrorCode::Provisioning, "the source is still being prepared")),
+            RepoState::CloneFailed(e) => return Err(err(ErrorCode::GitError, format!("the source is not available: {e}"))),
             RepoState::Ready => {}
         }
         if mi.is_active() {
@@ -511,8 +552,7 @@ impl InstanceManager {
             let config = InstanceConfig {
                 id: rand::random::<u128>(),
                 name,
-                repo_url: String::new(),
-                branch: None,
+                source: Source::None,
                 command: exe.display().to_string(),
                 args: vec!["-c".to_string(), config_path.display().to_string(), "start".to_string()],
                 env: HashMap::new(),
