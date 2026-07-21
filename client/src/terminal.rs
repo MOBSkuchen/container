@@ -2,20 +2,21 @@
 //!
 //! `shell` runs against a real PTY and is a dumb conduit in both directions,
 //! Ctrl+C included, ending when the shell does. `attach` bridges to the
-//! supervised process, which runs on pipes with no PTY, so this end runs a
-//! small line editor and Ctrl+C ends the session instead of being forwarded.
+//! supervised process, which runs on pipes with no PTY, so this end emulates
+//! the shell feel locally (`editor::LineEditor`) and Ctrl+C ends the session
+//! instead of being forwarded.
 
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures::StreamExt;
 use protocol::{Action, Response, TerminalMode, term};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::console::RawConsole;
+use crate::editor::{Keystroke, LineEditor};
 use crate::net::{self, Endpoint};
 
 /// Unix only: its shell pump forwards raw stdin bytes, so reading resize
@@ -404,29 +405,16 @@ fn ctrl_byte(c: char) -> Option<u8> {
     }
 }
 
-struct RawMode;
-
-impl RawMode {
-    fn enter() -> anyhow::Result<Self> {
-        enable_raw_mode().context("could not switch the terminal to raw mode")?;
-        Ok(RawMode)
-    }
-}
-
-impl Drop for RawMode {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-    }
-}
-
 pub async fn attach(endpoint: &Endpoint, id: u128, label: &str) -> anyhow::Result<()> {
     let stream = open_session(endpoint, TerminalMode::Attach(id)).await
         .with_context(|| format!("opening an attach session on {label}"))?;
 
-    println!("── attached to {label} · Ctrl+C detaches, the instance keeps running ──");
+    println!("── attached to {label} · Ctrl+C detaches, ↑↓ history, the instance keeps running ──");
 
     let ended_by_remote = {
-        let _raw = RawMode::enter()?;
+        // RawConsole rather than plain raw mode: the redraws below are ANSI,
+        // which a Windows console only interprets with VT processing on.
+        let _console = RawConsole::enter()?;
         pump_attach(stream).await?
     };
 
@@ -438,20 +426,42 @@ pub async fn attach(endpoint: &Endpoint, id: u128, label: &str) -> anyhow::Resul
     Ok(())
 }
 
+const PROMPT: &str = "\x1b[2m❯\x1b[22m ";
+
+/// The whole edit row: clear it, prompt, line, cursor put back in place.
+fn edit_row(editor: &LineEditor) -> String {
+    let display = editor.display();
+    let back = display.chars().count() - editor.cursor();
+    let mut row = format!("\r\x1b[K{PROMPT}{display}");
+    if back > 0 {
+        row.push_str(&format!("\x1b[{back}D"));
+    }
+    row
+}
+
 /// Returns true if the remote end closed the session, false if the user did.
+///
+/// The editor owns the bottom row; remote output (always whole lines) is
+/// written above it by clearing the row, printing, and putting the row back.
 async fn pump_attach(stream: TcpStream) -> anyhow::Result<bool> {
     let (mut sock_r, mut sock_w) = stream.into_split();
     let mut events = EventStream::new();
     let mut stdout = tokio::io::stdout();
-    let mut line: Vec<char> = Vec::new();
+    let mut editor = LineEditor::new();
     let mut buf = [0u8; 4096];
+
+    stdout.write_all(edit_row(&editor).as_bytes()).await?;
+    stdout.flush().await?;
 
     loop {
         tokio::select! {
             read = sock_r.read(&mut buf) => match read {
                 Ok(0) | Err(_) => return Ok(true),
                 Ok(n) => {
-                    stdout.write_all(&crlf(&buf[..n])).await?;
+                    let mut out = b"\r\x1b[K".to_vec();
+                    out.extend_from_slice(&crlf(&buf[..n]));
+                    out.extend_from_slice(edit_row(&editor).as_bytes());
+                    stdout.write_all(&out).await?;
                     stdout.flush().await?;
                 }
             },
@@ -462,46 +472,25 @@ async fn pump_attach(stream: TcpStream) -> anyhow::Result<bool> {
                     if is_ctrl(&key, 'c') {
                         return Ok(false);
                     }
-                    if let Some(out) = edit(&mut line, key) {
-                        stdout.write_all(out.echo.as_bytes()).await?;
-                        stdout.flush().await?;
-                        if let Some(send) = out.send
-                            && sock_w.write_all(send.as_bytes()).await.is_err() {
-                            return Ok(true);
+                    match editor.handle(&key) {
+                        Keystroke::Ignored => {}
+                        Keystroke::Edited => {
+                            stdout.write_all(edit_row(&editor).as_bytes()).await?;
+                            stdout.flush().await?;
+                        }
+                        Keystroke::Submit(text) => {
+                            // Scroll the submitted line away, then a fresh prompt.
+                            stdout.write_all(format!("\r\n{}", edit_row(&editor)).as_bytes()).await?;
+                            stdout.flush().await?;
+                            if sock_w.write_all(text.as_bytes()).await.is_err() {
+                                return Ok(true);
+                            }
                         }
                     }
                 }
                 Some(Ok(_)) => {}
             },
         }
-    }
-}
-
-struct Edit {
-    /// Local echo, since the remote is a pipe and echoes nothing.
-    echo: String,
-    send: Option<String>,
-}
-
-fn edit(line: &mut Vec<char>, key: KeyEvent) -> Option<Edit> {
-    match key.code {
-        KeyCode::Enter => {
-            let text: String = line.drain(..).collect();
-            Some(Edit { echo: "\r\n".to_string(), send: Some(format!("{text}\r\n")) })
-        }
-        KeyCode::Backspace => {
-            line.pop()?;
-            Some(Edit { echo: "\x08 \x08".to_string(), send: None })
-        }
-        KeyCode::Tab => {
-            line.push('\t');
-            Some(Edit { echo: "\t".to_string(), send: None })
-        }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            line.push(c);
-            Some(Edit { echo: c.to_string(), send: None })
-        }
-        _ => None,
     }
 }
 

@@ -9,6 +9,7 @@
 pub mod app;
 pub mod book;
 pub mod console;
+pub mod editor;
 pub mod form;
 pub mod instance_form;
 pub mod net;
