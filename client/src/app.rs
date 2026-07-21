@@ -16,7 +16,7 @@ use ratatui::Terminal;
 use ratatui::backend::Backend;
 use tokio::sync::{mpsc, watch, Notify};
 
-use protocol::{Action, ConsoleLine, DirEntry, InstanceStatResponse, InstanceStatus};
+use protocol::{Action, ConsoleLine, DirEntry, InstanceStatResponse, InstanceStatus, Source};
 
 use crate::book::{self, Book, ServerEntry};
 use crate::browse::{self, Browse, Side, Transfer};
@@ -213,7 +213,14 @@ pub enum Modal {
     /// `editing` is `None` for a new server, otherwise the entry's id.
     ServerForm { form: Form, editing: Option<u128> },
     /// `editing` is `None` for a new instance, otherwise the instance's id.
-    InstanceForm { form: Form, server: u128, editing: Option<u128> },
+    /// `upload_desc` is the recorded upload description when editing an
+    /// Upload instance — leaving the location at it keeps the content.
+    InstanceForm {
+        form: Form,
+        server: u128,
+        editing: Option<u128>,
+        upload_desc: Option<String>,
+    },
     Confirm {
         title: String,
         message: String,
@@ -394,6 +401,22 @@ impl App {
     /// The addressed, keyed endpoint for a server.
     pub fn endpoint(&self, server: u128) -> Option<Endpoint> {
         self.entry(server).map(|e| self.book.endpoint_or_keyless(e))
+    }
+
+    /// Save an instance's config, then push its new content; one toast for
+    /// the pair, since the user asked for one thing.
+    fn spawn_save_and_upload(&mut self, server: u128, id: u128, name: String, action: Action, path: PathBuf) {
+        let Some(endpoint) = self.endpoint(server) else { return };
+        let tx = self.events_tx.clone();
+        let refresh = self.refresh.clone();
+        tokio::spawn(async move {
+            let result = match net::done(&endpoint, action).await {
+                Ok(()) => transfer::upload_source(&endpoint, id, path).await.map_err(|e| format!("{e:#}")),
+                Err(e) => Err(e.to_string()),
+            };
+            refresh.notify_one();
+            let _ = tx.send(AppEvent::ActionDone { desc: format!("save '{name}'"), result }).await;
+        });
     }
 
     /// Fire an action at a server and report the outcome as a toast.
@@ -918,8 +941,12 @@ impl App {
             self.error("still loading this instance's configuration — try again in a moment");
             return;
         }
+        let upload_desc = config.and_then(|c| match &c.source {
+            Source::Upload { desc } => Some(desc.clone()),
+            _ => None,
+        });
         let form = instance_form::build(config);
-        self.modal = Some(Modal::InstanceForm { form, server, editing });
+        self.modal = Some(Modal::InstanceForm { form, server, editing, upload_desc });
     }
 
     fn confirm_remove_server(&mut self) {
@@ -1091,12 +1118,12 @@ impl App {
                 }
             },
 
-            Some(Modal::InstanceForm { form, server, editing }) => match form.handle_key(key) {
+            Some(Modal::InstanceForm { form, server, editing, upload_desc }) => match form.handle_key(key) {
                 FormOutcome::Cancel => self.modal = None,
                 FormOutcome::Idle => {}
                 FormOutcome::Submit => {
                     let (server, editing) = (*server, *editing);
-                    let parsed = match instance_form::parse(form) {
+                    let parsed = match instance_form::parse(form, upload_desc.as_deref()) {
                         Ok(parsed) => parsed,
                         Err(e) => {
                             form.error = Some(e);
@@ -1106,30 +1133,41 @@ impl App {
                     self.modal = None;
 
                     let name = parsed.name.clone();
+                    // A fresh local path means content to push after saving.
+                    let upload_path = parsed.source.upload_path();
                     match editing {
                         // Every field is sent: the server treats `None` as
                         // "unchanged", and the form always carries the whole
                         // config, so there is nothing to leave out.
-                        Some(id) => self.spawn_action(
-                            format!("save '{name}'"), server,
-                            Action::UpdateInstance {
+                        Some(id) => {
+                            let action = Action::UpdateInstance {
                                 id,
                                 name: Some(parsed.name),
-                                repo_url: Some(parsed.repo_url),
-                                branch: Some(parsed.branch),
+                                source: Some(parsed.source.to_source()),
                                 command: Some(parsed.command),
                                 args: Some(parsed.args),
                                 env: Some(parsed.env),
                                 autostart: Some(parsed.autostart),
                                 retry_policy: Some(parsed.retry_policy),
-                            },
-                        ),
+                            };
+                            match upload_path {
+                                None => self.spawn_action(format!("save '{name}'"), server, action),
+                                Some(path) => self.spawn_save_and_upload(server, id, name, action, path),
+                            }
+                        }
                         None => {
                             let Some(endpoint) = self.endpoint(server) else { return };
                             let tx = self.events_tx.clone();
                             let refresh = self.refresh.clone();
                             tokio::spawn(async move {
-                                let result = net::create(&endpoint, parsed).await.map(|_| ()).map_err(|e| e.to_string());
+                                let result = match net::create(&endpoint, parsed).await {
+                                    Ok(id) => match upload_path {
+                                        Some(path) => transfer::upload_source(&endpoint, id, path).await
+                                            .map_err(|e| format!("{e:#}")),
+                                        None => Ok(()),
+                                    },
+                                    Err(e) => Err(e.to_string()),
+                                };
                                 refresh.notify_one();
                                 let _ = tx.send(AppEvent::ActionDone {
                                     desc: format!("create '{name}'"), result,

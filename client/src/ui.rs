@@ -203,8 +203,8 @@ fn instance_status(inst: &InstanceStatResponse) -> (&'static str, String, Style)
         return ("◈", "this server".to_string(), Style::new().fg(Color::Green));
     }
     match &inst.repo {
-        RepoState::Provisioning => return ("⋯", "cloning…".to_string(), Style::new().fg(ACCENT)),
-        RepoState::CloneFailed(e) => return ("✗", format!("clone failed: {}", first_line(e)), Style::new().fg(Color::Red)),
+        RepoState::Provisioning => return ("⋯", "preparing…".to_string(), Style::new().fg(ACCENT)),
+        RepoState::CloneFailed(e) => return ("✗", format!("source failed: {}", first_line(e)), Style::new().fg(Color::Red)),
         RepoState::Ready => {}
     }
     match &inst.run {
@@ -416,17 +416,16 @@ fn detail_lines(app: &App, manage: &Manage, detail: &InstanceStatus) -> Vec<Line
     let mut lines = Vec::new();
 
     if config.self_managed {
-        lines.push(styled_field("repo", "this server manages itself".to_string(), Style::new().fg(ACCENT)));
+        lines.push(styled_field("source", "this server manages itself".to_string(), Style::new().fg(ACCENT)));
     } else {
-        let branch = config.branch.clone().unwrap_or_else(|| "default branch".to_string());
-        lines.push(field("repo", format!("{} ({branch})", config.repo_url)));
+        lines.push(field("source", instance_form::fmt_source(&config.source)));
 
         let (repo_label, repo_style) = match &detail.repo {
             RepoState::Ready => ("ready".to_string(), Style::new().fg(Color::Green)),
-            RepoState::Provisioning => ("cloning…".to_string(), Style::new().fg(ACCENT)),
-            RepoState::CloneFailed(e) => (format!("clone failed: {e}"), Style::new().fg(Color::Red)),
+            RepoState::Provisioning => ("preparing…".to_string(), Style::new().fg(ACCENT)),
+            RepoState::CloneFailed(e) => (format!("source failed: {e}"), Style::new().fg(Color::Red)),
         };
-        lines.push(styled_field("checkout", repo_label, repo_style));
+        lines.push(styled_field("content", repo_label, repo_style));
     }
 
     let command = if config.args.is_empty() {

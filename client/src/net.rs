@@ -175,8 +175,7 @@ pub async fn tail_console(endpoint: &Endpoint, id: u128, lines: u32) -> Result<(
 pub async fn create(endpoint: &Endpoint, spec: crate::instance_form::Parsed) -> Result<u128, NetError> {
     let action = Action::CreateInstance {
         name: spec.name,
-        repo_url: spec.repo_url,
-        branch: spec.branch,
+        source: spec.source.to_source(),
         command: spec.command,
         args: spec.args,
         env: spec.env,

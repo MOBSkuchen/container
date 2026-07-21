@@ -2,22 +2,25 @@
 //! flat text back into an `InstanceConfig`'s worth of typed values
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
-use protocol::{InstanceConfig, RetryPolicy};
+use protocol::{InstanceConfig, RetryPolicy, Source};
 
 use crate::form::{Field, Form};
 
 pub const NAME: usize = 0;
-pub const REPO: usize = 1;
-pub const BRANCH: usize = 2;
-pub const COMMAND: usize = 3;
-pub const ARGS: usize = 4;
-pub const ENV: usize = 5;
-pub const AUTOSTART: usize = 6;
-pub const POLICY: usize = 7;
-pub const RETRIES: usize = 8;
+pub const SOURCE: usize = 1;
+pub const LOCATION: usize = 2;
+pub const BRANCH: usize = 3;
+pub const COMMAND: usize = 4;
+pub const ARGS: usize = 5;
+pub const ENV: usize = 6;
+pub const AUTOSTART: usize = 7;
+pub const POLICY: usize = 8;
+pub const RETRIES: usize = 9;
 
 const POLICIES: [&str; 4] = ["Never", "OnCrash", "Always", "Retry"];
+const SOURCES: [&str; 3] = ["Git", "URL", "Upload"];
 
 pub fn build(existing: Option<&InstanceConfig>) -> Form {
     let title = match existing {
@@ -32,12 +35,20 @@ pub fn build(existing: Option<&InstanceConfig>) -> Form {
         Some(RetryPolicy::Retry(n)) => (3, n.to_string()),
     };
 
+    let (source_index, location, branch) = match existing.map(|c| &c.source) {
+        None | Some(Source::None) => (0, String::new(), String::new()),
+        Some(Source::Git { url, branch }) => (0, url.clone(), branch.clone().unwrap_or_default()),
+        Some(Source::Url { url }) => (1, url.clone(), String::new()),
+        Some(Source::Upload { desc }) => (2, desc.clone(), String::new()),
+    };
+
     let fields = vec![
         Field::text("Name", existing.map(|c| c.name.as_str()).unwrap_or("")),
-        Field::text("Repository", existing.map(|c| c.repo_url.as_str()).unwrap_or(""))
-            .hint("public git URL"),
-        Field::text("Branch", existing.and_then(|c| c.branch.as_deref()).unwrap_or(""))
-            .hint("blank = the repo's default"),
+        Field::select("Source", SOURCES.iter().map(|s| s.to_string()).collect(), source_index),
+        Field::text("Location", location)
+            .hint("git/download URL, or a local path to upload"),
+        Field::text("Branch", branch)
+            .hint("git only, blank = the repo's default"),
         Field::text("Command", existing.map(|c| c.command.as_str()).unwrap_or("")),
         Field::text("Arguments", existing.map(|c| fmt_args(&c.args)).unwrap_or_default())
             .hint("space separated, \"quote\" to group"),
@@ -52,11 +63,21 @@ pub fn build(existing: Option<&InstanceConfig>) -> Form {
     Form::new(title, fields)
 }
 
+/// What the source fields resolved to.
+pub enum SourceSpec {
+    Git { url: String, branch: Option<String> },
+    Url { url: String },
+    /// A local path whose content gets pushed after saving.
+    Upload { path: PathBuf },
+    /// Editing an Upload instance without giving a new path: the content on
+    /// the server stays as it is.
+    UploadKeep { desc: String },
+}
+
 /// Everything the form yields, validated. Field order matches `Action`'s
 pub struct Parsed {
     pub name: String,
-    pub repo_url: String,
-    pub branch: Option<String>,
+    pub source: SourceSpec,
     pub command: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
@@ -64,23 +85,39 @@ pub struct Parsed {
     pub retry_policy: RetryPolicy,
 }
 
-pub fn parse(form: &Form) -> Result<Parsed, String> {
+/// `keep_desc` is the recorded description when editing an Upload instance;
+/// leaving the location at that text means "keep the uploaded content".
+pub fn parse(form: &Form, keep_desc: Option<&str>) -> Result<Parsed, String> {
     let name = form.field(NAME).text_value().trim().to_string();
     if name.is_empty() {
         return Err("a name is required".to_string());
-    }
-    let repo_url = form.field(REPO).text_value().trim().to_string();
-    if repo_url.is_empty() {
-        return Err("a repository URL is required".to_string());
     }
     let command = form.field(COMMAND).text_value().trim().to_string();
     if command.is_empty() {
         return Err("a command is required".to_string());
     }
 
+    let location = form.field(LOCATION).text_value().trim().to_string();
+    if location.is_empty() {
+        return Err("a location is required".to_string());
+    }
     let branch = match form.field(BRANCH).text_value().trim() {
         "" => None,
         b => Some(b.to_string()),
+    };
+    let source = match form.field(SOURCE).select_index() {
+        0 => SourceSpec::Git { url: location, branch },
+        1 => SourceSpec::Url { url: location },
+        _ if Some(location.as_str()) == keep_desc => {
+            SourceSpec::UploadKeep { desc: location }
+        }
+        _ => {
+            let path = PathBuf::from(&location);
+            if !path.exists() {
+                return Err(format!("'{location}' does not exist here, so there is nothing to upload"));
+            }
+            SourceSpec::Upload { path }
+        }
     };
 
     let retry_policy = match form.field(POLICY).select_index() {
@@ -101,14 +138,50 @@ pub fn parse(form: &Form) -> Result<Parsed, String> {
 
     Ok(Parsed {
         name,
-        repo_url,
-        branch,
+        source,
         command,
         args: parse_args(&form.field(ARGS).text_value()),
         env: parse_env(&form.field(ENV).text_value())?,
         autostart: form.field(AUTOSTART).bool_value(),
         retry_policy,
     })
+}
+
+impl SourceSpec {
+    /// The wire form; an upload is recorded by what was pushed.
+    pub fn to_source(&self) -> Source {
+        match self {
+            SourceSpec::Git { url, branch } => Source::Git { url: url.clone(), branch: branch.clone() },
+            SourceSpec::Url { url } => Source::Url { url: url.clone() },
+            SourceSpec::Upload { path } => Source::Upload {
+                desc: path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string()),
+            },
+            SourceSpec::UploadKeep { desc } => Source::Upload { desc: desc.clone() },
+        }
+    }
+
+    /// The local path to push after saving, when there is one.
+    pub fn upload_path(&self) -> Option<PathBuf> {
+        match self {
+            SourceSpec::Upload { path } => Some(path.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// One line for the detail pane.
+pub fn fmt_source(source: &Source) -> String {
+    match source {
+        Source::Git { url, branch } => {
+            let branch = branch.clone().unwrap_or_else(|| "default branch".to_string());
+            format!("{url} ({branch})")
+        }
+        Source::Url { url } => format!("{url} (download)"),
+        Source::Upload { desc } => format!("uploaded '{desc}'"),
+        Source::None => "—".to_string(),
+    }
 }
 
 /// CL-style argument parsing

@@ -21,7 +21,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use protocol::{Action, ErrorCode, RepoState, Response, RetryPolicy, auth};
+use protocol::{Action, ErrorCode, RepoState, Response, RetryPolicy, Source, auth};
 
 use client::book::{Book, ServerEntry};
 use client::net::{self, Endpoint, NetError};
@@ -72,8 +72,7 @@ async fn ensure_instance(ep: &Endpoint) {
         Some(inst) => inst.id,
         None => match net::call(ep, Action::CreateInstance {
             name: INSTANCE.to_string(),
-            repo_url: "https://github.com/octocat/Hello-World".to_string(),
-            branch: None,
+            source: Source::Git { url: "https://github.com/octocat/Hello-World".to_string(), branch: None },
             command: "cmd.exe".to_string(),
             args: vec!["/q".into(), "/k".into(), "echo probe-instance".into()],
             env: Default::default(),

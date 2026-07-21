@@ -38,8 +38,27 @@ pub async fn upload(
             .context("pack task panicked")?
     };
     let result = match packed {
-        Ok(()) => upload_archive(endpoint, &tmp, dest, &progress).await,
+        Ok(()) => upload_archive(endpoint, &tmp, Action::UploadArchive { dest }, Some(&progress)).await,
         Err(e) => Err(e).context("packing the selection"),
+    };
+    let _ = tokio::fs::remove_file(&tmp).await;
+    result
+}
+
+/// Push the content of an Upload-source instance (a dir, archive or plain
+/// file, packed like any other transfer). No progress reporting — this runs
+/// behind a toast, not the browser.
+pub async fn upload_source(endpoint: &Endpoint, id: u128, path: PathBuf) -> anyhow::Result<()> {
+    let tmp = tmp_archive_path();
+    let packed = {
+        let tmp = tmp.clone();
+        tokio::task::spawn_blocking(move || pack_blocking(&[path], &tmp))
+            .await
+            .context("pack task panicked")?
+    };
+    let result = match packed {
+        Ok(()) => upload_archive(endpoint, &tmp, Action::UploadSource { id }, None).await,
+        Err(e) => Err(e).context("packing the content"),
     };
     let _ = tokio::fs::remove_file(&tmp).await;
     result
@@ -48,13 +67,15 @@ pub async fn upload(
 async fn upload_archive(
     endpoint: &Endpoint,
     archive: &Path,
-    dest: PathBuf,
-    progress: &Progress,
+    action: Action,
+    progress: Option<&Progress>,
 ) -> anyhow::Result<()> {
     let total = tokio::fs::metadata(archive).await.context("reading the packed archive")?.len();
-    let _ = progress.send((0, Some(total)));
+    if let Some(progress) = progress {
+        let _ = progress.send((0, Some(total)));
+    }
 
-    let mut stream = net::open_session(endpoint, Action::UploadArchive { dest }).await?;
+    let mut stream = net::open_session(endpoint, action).await?;
     let mut file = tokio::fs::File::open(archive).await.context("opening the packed archive")?;
 
     stream.write_all(&total.to_be_bytes()).await.context("sending the archive size")?;
@@ -67,7 +88,9 @@ async fn upload_archive(
         }
         stream.write_all(&buf[..n]).await.context("the connection dropped mid-transfer")?;
         sent += n as u64;
-        let _ = progress.send((sent, Some(total)));
+        if let Some(progress) = progress {
+            let _ = progress.send((sent, Some(total)));
+        }
     }
 
     // The ack arrives only after the server has unpacked, so success here

@@ -27,7 +27,7 @@ use client::net::{Endpoint, NetError};
 use client::target;
 use client::terminal as terminal_mod;
 use protocol::{auth, term};
-use protocol::{Action, ErrorCode, RepoState, Response, RetryPolicy, RunState, TerminalMode};
+use protocol::{Action, ErrorCode, RepoState, Response, RetryPolicy, RunState, Source, TerminalMode};
 
 const INSTANCE: &str = "tui-smoke";
 /// Must match the phrase the test server was created with.
@@ -506,8 +506,7 @@ async fn create_instance(addr: SocketAddr) -> u128 {
 
     match client::net::call(&endpoint(addr), Action::CreateInstance {
         name: INSTANCE.to_string(),
-        repo_url: "https://github.com/octocat/Hello-World".to_string(),
-        branch: None,
+        source: Source::Git { url: "https://github.com/octocat/Hello-World".to_string(), branch: None },
         // Interactive, so the attach session has a live stdin to talk to.
         command: "cmd.exe".to_string(),
         args: vec!["/q".to_string(), "/k".to_string(), "echo instance-started".to_string()],
