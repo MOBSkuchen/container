@@ -530,6 +530,62 @@ async fn run_full(addr: SocketAddr) {
         ErrorCode::AccessDenied, "out-of-root absolute path",
     );
 
+    // 6c. Archive transfer: upload a small tree as tar.gz, expect it unpacked
+    //     server-side; download it back together with the earlier upload.
+    let tree = std::env::temp_dir().join(format!("smoke-tree-{:08x}", rand::random::<u32>()));
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::write(tree.join("a.txt"), b"alpha").unwrap();
+    std::fs::write(tree.join("sub").join("b.txt"), b"beta").unwrap();
+
+    let mut tarball = Vec::new();
+    {
+        let enc = flate2::write::GzEncoder::new(&mut tarball, flate2::Compression::default());
+        let mut tar = tar::Builder::new(enc);
+        tar.append_dir_all("smoke-tree", &tree).unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+    }
+
+    let dest_dir = PathBuf::from(format!("instances/{id:032x}/repo"));
+    let resp = call(addr, Action::UploadArchive { dest: dest_dir.clone() }).await;
+    let (mut up, _) = open_session(addr, resp).await;
+    up.write_all(&(tarball.len() as u64).to_be_bytes()).await.unwrap();
+    up.write_all(&tarball).await.unwrap();
+    let mut ack = [0u8; 1];
+    up.read_exact(&mut ack).await.expect("no unpack ack");
+    assert_eq!(ack[0], 1);
+    match call(addr, Action::ListDir { path: dest_dir.join("smoke-tree") }).await {
+        Response::DirListing { entries, .. } => {
+            assert!(entries.iter().any(|e| e.name == "a.txt" && !e.is_dir), "a.txt missing after unpack");
+            assert!(entries.iter().any(|e| e.name == "sub" && e.is_dir), "sub/ missing after unpack");
+        }
+        other => panic!("unpacked tree not listable: {other:?}"),
+    }
+    println!("OK   archive upload (unpacked server-side)");
+
+    let resp = call(addr, Action::DownloadArchive { paths: vec![
+        dest_dir.join("smoke-tree"),
+        dest_dir.join("smoke-upload.bin"),
+    ] }).await;
+    let (mut down, _) = open_session(addr, resp).await;
+    let mut len_buf = [0u8; 8];
+    down.read_exact(&mut len_buf).await.expect("no archive length");
+    let mut archive = vec![0u8; u64::from_be_bytes(len_buf) as usize];
+    down.read_exact(&mut archive).await.expect("archive cut short");
+
+    let unpacked = std::env::temp_dir().join(format!("smoke-unpack-{:08x}", rand::random::<u32>()));
+    tar::Archive::new(flate2::read::GzDecoder::new(&archive[..])).unpack(&unpacked).unwrap();
+    assert_eq!(std::fs::read(unpacked.join("smoke-tree").join("a.txt")).unwrap(), b"alpha");
+    assert_eq!(std::fs::read(unpacked.join("smoke-tree").join("sub").join("b.txt")).unwrap(), b"beta");
+    assert_eq!(std::fs::read(unpacked.join("smoke-upload.bin")).unwrap(), payload);
+    println!("OK   archive download (round-trip matches)");
+
+    expect_err(
+        &call(addr, Action::DownloadArchive { paths: vec![PathBuf::from("C:\\Windows")] }).await,
+        ErrorCode::AccessDenied, "archive out-of-root",
+    );
+    let _ = std::fs::remove_dir_all(&tree);
+    let _ = std::fs::remove_dir_all(&unpacked);
+
     // 7. Update config + repo, then autostart prep for phase2.
     match call(addr, Action::StopInstance { id }).await {
         Response::Done => println!("OK   stop"),

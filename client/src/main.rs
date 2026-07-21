@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, watch, Notify};
 
 use client::app::{self, App, RunOutcome, SessionKind, SessionRequest};
 use client::book::{self, Book};
-use client::{target, terminal};
+use client::{net, target, terminal};
 
 #[derive(Parser)]
 #[command(version, about = "Manage container servers and their instances", long_about = None)]
@@ -29,6 +29,11 @@ enum Command {
     },
     #[command(long_about = "Opens the shell on the remote server. Detaching requires exiting via remote (i.e. using exit)", about = "Opens the shell on the remote server.")]
     Shell {
+        #[arg(help = "<server>/<instance> or just <server> if the name is unambiguous")]
+        target: String,
+    },
+    #[command(about = "Browse and copy files between here and an instance's checkout")]
+    Browse {
         #[arg(help = "<server>/<instance> or just <server> if the name is unambiguous")]
         target: String,
     },
@@ -69,11 +74,30 @@ async fn run() -> anyhow::Result<()> {
             let found = target::resolve(&book, &target).await?;
             terminal::shell(&found.endpoint, found.instance.id, &found.label()).await
         }
+        Some(Command::Browse { target }) => {
+            let found = target::resolve(&book, &target).await?;
+            // The browser roots its remote panel at the checkout.
+            let detail = net::check(&found.endpoint, found.instance.id).await
+                .map_err(|e| anyhow::anyhow!("reading {}: {e}", found.label()))?;
+            let start = BrowseStart {
+                server: found.server.id,
+                instance: found.instance.id,
+                remote_root: detail.repo_dir,
+            };
+            tui(book, config_path, Some(start)).await
+        }
         Some(Command::Keygen { phrase, key, server }) => {
             keygen(book, config_path, phrase, key, server).await
         }
-        None => tui(book, config_path).await,
+        None => tui(book, config_path, None).await,
     }
+}
+
+/// Opening screen for `client browse`.
+struct BrowseStart {
+    server: u128,
+    instance: u128,
+    remote_root: PathBuf,
 }
 
 async fn keygen(
@@ -122,7 +146,7 @@ async fn keygen(
     Ok(())
 }
 
-async fn tui(book: Book, config_path: PathBuf) -> anyhow::Result<()> {
+async fn tui(book: Book, config_path: PathBuf, browse: Option<BrowseStart>) -> anyhow::Result<()> {
     let (book_tx, book_rx) = watch::channel(book.clone());
     let (events_tx, mut events_rx) = mpsc::channel(64);
     let refresh = Arc::new(Notify::new());
@@ -133,6 +157,9 @@ async fn tui(book: Book, config_path: PathBuf) -> anyhow::Result<()> {
     // cannot leave the console in raw mode.
     let mut terminal = ratatui::init();
     let mut app = App::new(book, config_path, book_tx, refresh, events_tx);
+    if let Some(start) = browse {
+        app.open_browse(start.server, start.instance, start.remote_root);
+    }
     let result = loop {
         // Rebuilt per lap: a session runs its own EventStream, and two live
         // ones would compete for the same console events.

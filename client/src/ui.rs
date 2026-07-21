@@ -9,10 +9,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::app::{App, ConfirmToggle, Manage, Modal, Row, Screen, ServerState, ToastKind};
+use crate::browse::{Browse, Side};
 use crate::form::{FieldKind, Form};
 use crate::instance_form;
 use protocol::{
-    ConsoleLine, InstanceStatResponse, InstanceStatus, RepoState, RetryPolicy, RunState, Stream,
+    ConsoleLine, DirEntry, InstanceStatResponse, InstanceStatus, RepoState, RetryPolicy, RunState,
+    Stream,
 };
 
 const ACCENT: Color = Color::Cyan;
@@ -35,6 +37,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::Manage(manage) => {
             draw_manage(frame, app, manage, body);
             draw_keys(frame, keys, MANAGE_KEYS);
+        }
+        Screen::Browse(browse) => {
+            draw_browse(frame, browse, body);
+            draw_keys(frame, keys, BROWSE_KEYS);
         }
     }
     draw_status(frame, app, status);
@@ -72,6 +78,18 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
                     .unwrap_or_else(|| format!("{:032x}", m.instance)),
                 Style::new().add_modifier(Modifier::BOLD),
             ));
+        }
+        Screen::Browse(b) => {
+            let server = app.entry(b.server).map(|e| e.name.clone()).unwrap_or_default();
+            spans.push(Span::styled(server, Style::new().fg(DIM)));
+            spans.push(Span::styled(" / ", Style::new().fg(DIM)));
+            spans.push(Span::styled(
+                app.instances_of(b.server).iter().find(|i| i.id == b.instance)
+                    .map(|i| i.name.clone())
+                    .unwrap_or_else(|| format!("{:032x}", b.instance)),
+                Style::new().add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(" · files", Style::new().fg(DIM)));
         }
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -514,6 +532,127 @@ fn run_summary(run: &RunState) -> (&'static str, String, Style) {
     }
 }
 
+fn draw_browse(frame: &mut Frame, browse: &Browse, area: Rect) {
+    let [panes, foot] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(area);
+    let [left, right] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(panes);
+    draw_panel(frame, browse, Side::Local, left);
+    draw_panel(frame, browse, Side::Remote, right);
+    draw_transfer(frame, browse, foot);
+}
+
+fn draw_panel(frame: &mut Frame, browse: &Browse, side: Side, area: Rect) {
+    let panel = browse.panel(side);
+    let focused = browse.focus == side;
+    let color = if focused { ACCENT } else { DIM };
+
+    let mut title = format!(" {} · {} ", side.name(), shorten_path(&panel.cwd, area.width.saturating_sub(14) as usize));
+    if panel.loading {
+        title.push_str("… ");
+    }
+    let mut block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(color))
+        .title(Span::styled(title, Style::new().fg(color).add_modifier(if focused { Modifier::BOLD } else { Modifier::empty() })));
+    if !panel.selected.is_empty() {
+        block = block.title_bottom(Span::styled(
+            format!(" {} marked ", panel.selected.len()),
+            Style::new().fg(ACCENT),
+        ));
+    }
+
+    if let Some(e) = &panel.error {
+        let text = Paragraph::new(Line::styled(first_line(e), Style::new().fg(Color::Red)))
+            .block(block)
+            .wrap(Wrap { trim: false });
+        frame.render_widget(text, area);
+        return;
+    }
+
+    let width = area.width.saturating_sub(4) as usize;
+    let mut items: Vec<ListItem> = panel.entries.iter()
+        .map(|entry| ListItem::new(panel_row(entry, panel.selected.contains(&entry.name), width)))
+        .collect();
+    // Ghosts of an incoming copy, until the refresh delivers the real thing.
+    for name in &panel.incoming {
+        if !panel.entries.iter().any(|e| &e.name == name) {
+            items.push(ListItem::new(Line::styled(
+                format!("⇣ {name}"),
+                Style::new().fg(DIM).add_modifier(Modifier::ITALIC),
+            )));
+        }
+    }
+    if items.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            if panel.loading { "loading…" } else { "empty" },
+            Style::new().fg(DIM),
+        )));
+    }
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::new().bg(Color::Rgb(38, 42, 52)).add_modifier(Modifier::BOLD));
+    let mut state = ListState::default()
+        .with_selected((focused && !panel.entries.is_empty()).then_some(panel.cursor));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn panel_row(entry: &DirEntry, marked: bool, width: usize) -> Line<'static> {
+    let marker = if marked { "▪" } else { " " };
+    let name = if entry.is_dir { format!("{}/", entry.name) } else { entry.name.clone() };
+    let size = if entry.is_dir { String::new() } else { fmt_bytes(entry.size) };
+    let pad = width.saturating_sub(2 + name.chars().count() + size.chars().count()).max(1);
+    Line::from(vec![
+        Span::styled(format!("{marker} "), Style::new().fg(ACCENT)),
+        Span::styled(name, if entry.is_dir { Style::new().fg(ACCENT) } else { Style::new() }),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(size, Style::new().fg(DIM)),
+    ])
+}
+
+fn draw_transfer(frame: &mut Frame, browse: &Browse, area: Rect) {
+    let Some(transfer) = &browse.transfer else {
+        let hint = Line::styled(
+            " tab switches panels · space marks · c copies to the other panel",
+            Style::new().fg(DIM),
+        );
+        frame.render_widget(Paragraph::new(hint), area);
+        return;
+    };
+
+    let (done, total) = *transfer.progress.borrow();
+    let line = match total {
+        Some(total) if total > 0 => {
+            const WIDTH: usize = 24;
+            let ratio = (done as f64 / total as f64).clamp(0.0, 1.0);
+            let filled = (ratio * WIDTH as f64).round() as usize;
+            let tail = if done >= total {
+                "unpacking…".to_string()
+            } else {
+                format!("{}/{}", fmt_bytes(done), fmt_bytes(total))
+            };
+            Line::from(vec![
+                Span::styled(format!(" {}  ", transfer.label), Style::new().fg(ACCENT)),
+                Span::styled("▓".repeat(filled), Style::new().fg(ACCENT)),
+                Span::styled("░".repeat(WIDTH - filled), Style::new().fg(DIM)),
+                Span::raw(format!(" {:>3.0}%  {tail}", ratio * 100.0)),
+            ])
+        }
+        _ => Line::styled(format!(" {}  packing…", transfer.label), Style::new().fg(ACCENT)),
+    };
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// Keep the tail of a long path; the head is the least informative part.
+fn shorten_path(path: &std::path::Path, max: usize) -> String {
+    let text = path.display().to_string();
+    let count = text.chars().count();
+    if count <= max.max(8) {
+        return text;
+    }
+    let keep = max.max(8) - 1;
+    format!("…{}", text.chars().skip(count - keep).collect::<String>())
+}
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let line = match &app.toast {
         Some(toast) => {
@@ -539,7 +678,12 @@ const LANDING_KEYS: &[(&str, &str)] = &[
 const MANAGE_KEYS: &[(&str, &str)] = &[
     ("↑↓", "instance"), ("pgup/pgdn", "console"), ("r", "start"), ("x", "stop"),
     ("k", "kill"), ("u", "update repo"), ("s", "shell"), ("a", "attach"),
-    ("e", "edit"), ("D", "remove"), ("?", "help"), ("esc", "back"),
+    ("b", "files"), ("e", "edit"), ("D", "remove"), ("?", "help"), ("esc", "back"),
+];
+
+const BROWSE_KEYS: &[(&str, &str)] = &[
+    ("tab", "panel"), ("↑↓", "move"), ("enter", "open"), ("bksp", "up"),
+    ("space", "mark"), ("c", "copy"), ("r", "reload"), ("?", "help"), ("esc", "back"),
 ];
 
 fn draw_keys(frame: &mut Frame, area: Rect, keys: &[(&str, &str)]) {
@@ -694,10 +838,21 @@ fn draw_help(frame: &mut Frame, app: &App) {
             ("u", "re-clone the repo — the instance must be stopped"),
             ("s", "open a shell in the checkout (the TUI steps aside)"),
             ("a", "attach to the running process (the TUI steps aside)"),
+            ("b", "browse files — copy between here and the checkout"),
             ("e", "edit this instance's configuration"),
             ("n", "create another instance on this server"),
             ("D", "remove this instance from the server"),
             ("esc", "back to the server list"),
+        ],
+        Screen::Browse(_) => &[
+            ("tab", "switch between the local and remote panel"),
+            ("↑ ↓ / k j", "move the cursor"),
+            ("enter", "open the directory under the cursor"),
+            ("backspace", "go to the parent directory"),
+            ("space", "mark / unmark the entry under the cursor"),
+            ("c / F5", "copy the marked entries into the other panel"),
+            ("r", "reload both panels"),
+            ("esc", "back"),
         ],
     };
 
@@ -708,6 +863,11 @@ fn draw_help(frame: &mut Frame, app: &App) {
             "  client shell <server>/<instance>    a new shell in the checkout",
             "  client attach <server>/<instance>   the running process",
             "Ctrl+C ends a session; an attached instance keeps running.",
+        ],
+        Screen::Browse(_) => &[
+            "With nothing marked, c copies the entry under the cursor.",
+            "Copies are packed, streamed, then unpacked; existing files",
+            "prompt for overwrite-or-skip before anything moves.",
         ],
     };
 

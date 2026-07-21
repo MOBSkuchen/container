@@ -6,12 +6,13 @@
 //! the shell feel locally (`editor::LineEditor`) and Ctrl+C ends the session
 //! instead of being forwarded.
 
+#[cfg(not(windows))]
 use std::time::Duration;
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
-use protocol::{Action, Response, TerminalMode, term};
+use protocol::{Action, TerminalMode, term};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -27,30 +28,7 @@ const RESIZE_POLL: Duration = Duration::from_millis(250);
 
 /// Split out from the bridges so it can be exercised without a TTY.
 pub async fn open_session(endpoint: &Endpoint, mode: TerminalMode) -> anyhow::Result<TcpStream> {
-    let addr = endpoint.addr;
-    let (port, token, ttl_secs) = match net::call(endpoint, Action::OpenTerminal { mode }).await {
-        Ok(Response::SessionOpened { port, token, ttl_secs, .. }) => (port, token, ttl_secs),
-        Ok(other) => bail!("expected a terminal session, got {other:?}"),
-        Err(e) => bail!("{e}"),
-    };
-
-    let mut stream = tokio::time::timeout(
-        Duration::from_secs(ttl_secs.max(1)),
-        TcpStream::connect((addr.ip(), port)),
-    ).await
-        .with_context(|| format!("session port {port} did not accept a connection within {ttl_secs}s"))?
-        .with_context(|| format!("connecting to session port {port}"))?;
-
-    // Nagle would batch a keystroke and its echo into visible typing lag.
-    let _ = stream.set_nodelay(true);
-
-    stream.write_all(&token).await.context("sending the session token")?;
-    let mut ack = [0u8; 1];
-    stream.read_exact(&mut ack).await.context("the server closed the session without acknowledging it")?;
-    if ack[0] != 1 {
-        bail!("the server rejected the session token");
-    }
-    Ok(stream)
+    net::open_session(endpoint, Action::OpenTerminal { mode }).await
 }
 
 pub fn window_size() -> (u16, u16) {

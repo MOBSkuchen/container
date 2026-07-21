@@ -2,13 +2,17 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
+use anyhow::Context;
 use bierpc::RpcClient;
 use protocol::auth;
 use protocol::{
-    Action, ApiError, AuthFailure, ConsoleLine, InstanceStatResponse, InstanceStatus, Reply,
-    Request, Response,
+    Action, ApiError, AuthFailure, ConsoleLine, DirEntry, InstanceStatResponse, InstanceStatus,
+    Reply, Request, Response,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -188,4 +192,41 @@ pub async fn done(endpoint: &Endpoint, action: Action) -> Result<(), NetError> {
         Response::Done => Ok(()),
         other => Err(unexpected("Done", other)),
     }
+}
+
+/// Resolved path plus its entries, as the server listed them
+pub async fn list_dir(endpoint: &Endpoint, path: PathBuf) -> Result<(PathBuf, Vec<DirEntry>), NetError> {
+    match call(endpoint, Action::ListDir { path }).await? {
+        Response::DirListing { path, entries } => Ok((path, entries)),
+        other => Err(unexpected("DirListing", other)),
+    }
+}
+
+/// Ask for a side-channel session and complete its token handshake.
+/// The stream is ready for the session protocol when this returns.
+pub async fn open_session(endpoint: &Endpoint, action: Action) -> anyhow::Result<TcpStream> {
+    let addr = endpoint.addr;
+    let (port, token, ttl_secs) = match call(endpoint, action).await {
+        Ok(Response::SessionOpened { port, token, ttl_secs, .. }) => (port, token, ttl_secs),
+        Ok(other) => anyhow::bail!("expected a session offer, got {other:?}"),
+        Err(e) => anyhow::bail!("{e}"),
+    };
+
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(ttl_secs.max(1)),
+        TcpStream::connect((addr.ip(), port)),
+    ).await
+        .with_context(|| format!("session port {port} did not accept a connection within {ttl_secs}s"))?
+        .with_context(|| format!("connecting to session port {port}"))?;
+
+    // Nagle would batch a keystroke and its echo into visible typing lag.
+    let _ = stream.set_nodelay(true);
+
+    stream.write_all(&token).await.context("sending the session token")?;
+    let mut ack = [0u8; 1];
+    stream.read_exact(&mut ack).await.context("the server closed the session without acknowledging it")?;
+    if ack[0] != 1 {
+        anyhow::bail!("the server rejected the session token");
+    }
+    Ok(stream)
 }

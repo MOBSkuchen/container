@@ -16,13 +16,14 @@ use ratatui::Terminal;
 use ratatui::backend::Backend;
 use tokio::sync::{mpsc, watch, Notify};
 
-use protocol::{Action, ConsoleLine, InstanceStatResponse, InstanceStatus};
+use protocol::{Action, ConsoleLine, DirEntry, InstanceStatResponse, InstanceStatus};
 
 use crate::book::{self, Book, ServerEntry};
+use crate::browse::{self, Browse, Side, Transfer};
 use crate::form::{Field, Form, FormOutcome};
 use crate::instance_form;
 use crate::net::{self, Endpoint, NetError, Vitals};
-use crate::ui;
+use crate::{transfer, ui};
 
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(250);
@@ -43,6 +44,17 @@ pub enum AppEvent {
     },
     /// Outcome of a one-shot action; `desc` is what the user asked for.
     ActionDone { desc: String, result: Result<(), String> },
+    /// Listing of a local directory for the browser.
+    LocalDir { path: PathBuf, result: Result<Vec<DirEntry>, String> },
+    /// Listing of a remote directory; `requested` is what was asked for,
+    /// the result carries the server's resolved spelling.
+    RemoteDir {
+        server: u128,
+        requested: PathBuf,
+        result: Result<(PathBuf, Vec<DirEntry>), String>,
+    },
+    /// A transfer finished; `desc` describes it for the toast.
+    TransferDone { server: u128, result: Result<String, String> },
 }
 
 pub struct ServerState {
@@ -112,6 +124,7 @@ pub enum Row {
 pub enum Screen {
     Landing,
     Manage(Manage),
+    Browse(Browse),
 }
 
 pub struct Manage {
@@ -142,10 +155,23 @@ impl Manage {
     }
 }
 
+/// A copy the confirm modal is sitting on. `names` are top-level entries in
+/// `src_dir`; `conflicts` is the subset already present in `dest_dir`.
+pub struct TransferPlan {
+    pub server: u128,
+    /// Which side is the source; the other side receives.
+    pub from: Side,
+    pub src_dir: PathBuf,
+    pub dest_dir: PathBuf,
+    pub names: Vec<String>,
+    pub conflicts: Vec<String>,
+}
+
 pub enum Pending {
     RemoveServer(u128),
     KillInstance { server: u128, instance: u128 },
     RemoveInstance { server: u128, instance: u128 },
+    Transfer(TransferPlan),
 }
 
 #[derive(Clone, Copy)]
@@ -253,6 +279,20 @@ impl App {
     pub fn manage(&self) -> Option<&Manage> {
         match self.screen() {
             Screen::Manage(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    pub fn browse(&self) -> Option<&Browse> {
+        match self.screen() {
+            Screen::Browse(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    fn browse_mut(&mut self) -> Option<&mut Browse> {
+        match self.screens.last_mut() {
+            Some(Screen::Browse(b)) => Some(b),
             _ => None,
         }
     }
@@ -437,6 +477,42 @@ impl App {
                 Ok(()) => self.info(format!("{desc}: ok")),
                 Err(e) => self.error(format!("{desc} failed — {e}")),
             },
+            AppEvent::LocalDir { path, result } => {
+                // Stale guard: only the listing for where the panel is now.
+                if let Some(Screen::Browse(b)) = self.screens.last_mut()
+                    && b.local.cwd == path {
+                    b.local.apply(path, result);
+                }
+            }
+            AppEvent::RemoteDir { server, requested, result } => {
+                if let Some(Screen::Browse(b)) = self.screens.last_mut()
+                    && b.server == server && b.remote.cwd == requested {
+                    match result {
+                        Ok((resolved, entries)) => {
+                            // Adopt the server's spelling, keeping the floor
+                            // comparable when this was the root itself.
+                            if b.remote.cwd == b.remote_root {
+                                b.remote_root = resolved.clone();
+                            }
+                            b.remote.apply(resolved, Ok(entries));
+                        }
+                        Err(e) => b.remote.apply(requested, Err(e)),
+                    }
+                }
+            }
+            AppEvent::TransferDone { server, result } => {
+                if let Some(Screen::Browse(b)) = self.screens.last_mut()
+                    && b.server == server {
+                    b.transfer = None;
+                    b.local.incoming.clear();
+                    b.remote.incoming.clear();
+                }
+                match result {
+                    Ok(desc) => self.info(desc),
+                    Err(e) => self.error(format!("transfer failed — {e}")),
+                }
+                self.browse_refresh();
+            }
         }
     }
 
@@ -476,6 +552,7 @@ impl App {
         match self.screen() {
             Screen::Landing => self.on_key_landing(key),
             Screen::Manage(_) => self.on_key_manage(key),
+            Screen::Browse(_) => self.on_key_browse(key),
         }
     }
 
@@ -556,6 +633,7 @@ impl App {
             KeyCode::Char('n') => self.open_instance_form(server, None),
             KeyCode::Char('s') => self.request_session(SessionKind::Shell),
             KeyCode::Char('a') => self.request_session(SessionKind::Attach),
+            KeyCode::Char('b') => self.open_browse_for_manage(),
             _ => {}
         }
     }
@@ -572,6 +650,204 @@ impl App {
             self.instance_name(server, instance),
         );
         self.pending_session = Some(SessionRequest { kind, endpoint, instance, label });
+    }
+
+    fn open_browse_for_manage(&mut self) {
+        let Some(m) = self.manage() else { return };
+        let (server, instance) = (m.server, m.instance);
+        let Some(root) = m.detail.as_ref().map(|d| d.repo_dir.clone()) else {
+            self.error("still loading this instance's checkout path — try again in a moment");
+            return;
+        };
+        self.open_browse(server, instance, root);
+    }
+
+    pub fn open_browse(&mut self, server: u128, instance: u128, remote_root: PathBuf) {
+        let local_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        self.screens.push(Screen::Browse(Browse::new(server, instance, local_cwd.clone(), remote_root.clone())));
+        self.fetch_local(local_cwd);
+        self.fetch_remote(server, remote_root);
+    }
+
+    fn fetch_local(&self, path: PathBuf) {
+        let tx = self.events_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = browse::read_local_dir(&path);
+            let _ = tx.blocking_send(AppEvent::LocalDir { path, result });
+        });
+    }
+
+    fn fetch_remote(&self, server: u128, path: PathBuf) {
+        let Some(endpoint) = self.endpoint(server) else { return };
+        let tx = self.events_tx.clone();
+        tokio::spawn(async move {
+            let result = net::list_dir(&endpoint, path.clone()).await.map_err(|e| e.to_string());
+            let _ = tx.send(AppEvent::RemoteDir { server, requested: path, result }).await;
+        });
+    }
+
+    fn on_key_browse(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.pop_screen(),
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('?') => self.modal = Some(Modal::Help),
+
+            KeyCode::Tab => {
+                if let Some(b) = self.browse_mut() {
+                    b.focus = b.focus.other();
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.browse_move(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.browse_move(1),
+            KeyCode::Home => self.browse_move(isize::MIN),
+            KeyCode::End => self.browse_move(isize::MAX),
+            KeyCode::Enter => self.browse_enter(),
+            KeyCode::Backspace => self.browse_parent(),
+            KeyCode::Char(' ') => {
+                if let Some(b) = self.browse_mut() {
+                    let focus = b.focus;
+                    b.panel_mut(focus).toggle_selected();
+                }
+            }
+            KeyCode::Char('c') | KeyCode::F(5) => self.plan_transfer(),
+            KeyCode::Char('r') => self.browse_refresh(),
+            _ => {}
+        }
+    }
+
+    fn browse_move(&mut self, delta: isize) {
+        let Some(b) = self.browse_mut() else { return };
+        let focus = b.focus;
+        let panel = b.panel_mut(focus);
+        let len = panel.entries.len();
+        if len == 0 {
+            return;
+        }
+        panel.cursor = match delta {
+            isize::MIN => 0,
+            isize::MAX => len - 1,
+            d if d < 0 => panel.cursor.saturating_sub(d.unsigned_abs()),
+            d => (panel.cursor + d as usize).min(len - 1),
+        };
+    }
+
+    fn browse_enter(&mut self) {
+        let Some(b) = self.browse_mut() else { return };
+        let (focus, server) = (b.focus, b.server);
+        let panel = b.panel_mut(focus);
+        let Some(entry) = panel.under_cursor() else { return };
+        if !entry.is_dir {
+            return;
+        }
+        let next = panel.cwd.join(&entry.name);
+        panel.navigate(next.clone());
+        match focus {
+            Side::Local => self.fetch_local(next),
+            Side::Remote => self.fetch_remote(server, next),
+        }
+    }
+
+    fn browse_parent(&mut self) {
+        let Some(b) = self.browse_mut() else { return };
+        let (focus, server) = (b.focus, b.server);
+        let Some(parent) = b.parent_of(focus) else { return };
+        b.panel_mut(focus).navigate(parent.clone());
+        match focus {
+            Side::Local => self.fetch_local(parent),
+            Side::Remote => self.fetch_remote(server, parent),
+        }
+    }
+
+    fn browse_refresh(&mut self) {
+        let Some(b) = self.browse_mut() else { return };
+        let server = b.server;
+        let (local, remote) = (b.local.cwd.clone(), b.remote.cwd.clone());
+        b.local.loading = true;
+        b.remote.loading = true;
+        self.fetch_local(local);
+        self.fetch_remote(server, remote);
+    }
+
+    /// Work out what a copy would do and put it up for confirmation.
+    fn plan_transfer(&mut self) {
+        let Some(b) = self.browse() else { return };
+        if b.transfer.is_some() {
+            self.error("a transfer is already running");
+            return;
+        }
+        let from = b.focus;
+        let src = b.panel(from);
+        let names = src.picked();
+        if names.is_empty() {
+            self.error("nothing selected");
+            return;
+        }
+        let dest = b.panel(from.other());
+        let conflicts: Vec<String> = names.iter()
+            .filter(|n| dest.entries.iter().any(|e| &&e.name == n))
+            .cloned()
+            .collect();
+        let plan = TransferPlan {
+            server: b.server,
+            from,
+            src_dir: src.cwd.clone(),
+            dest_dir: dest.cwd.clone(),
+            names,
+            conflicts,
+        };
+
+        let mut message = format!(
+            "Copy {} to the {} directory\n{}?",
+            describe(&plan.names), from.other().name(), plan.dest_dir.display(),
+        );
+        let toggle = (!plan.conflicts.is_empty()).then(|| {
+            message.push_str(&format!(
+                "\n\nAlready there: {}",
+                sample(&plan.conflicts),
+            ));
+            ConfirmToggle { label: "overwrite them (off: they are skipped)".to_string(), value: false }
+        });
+        self.modal = Some(Modal::Confirm {
+            title: "Copy files".to_string(),
+            message,
+            toggle,
+            pending: Pending::Transfer(plan),
+        });
+    }
+
+    fn start_transfer(&mut self, plan: TransferPlan, overwrite: bool) {
+        let TransferPlan { server, from, src_dir, dest_dir, names, conflicts } = plan;
+        let names: Vec<String> = if overwrite {
+            names
+        } else {
+            names.into_iter().filter(|n| !conflicts.contains(n)).collect()
+        };
+        if names.is_empty() {
+            self.info("everything already exists there — nothing copied");
+            return;
+        }
+        let Some(endpoint) = self.endpoint(server) else { return };
+
+        let (progress_tx, progress_rx) = watch::channel((0u64, None));
+        let what = describe(&names);
+        if let Some(b) = self.browse_mut() {
+            b.transfer = Some(Transfer {
+                label: format!("{what} → {}", from.other().name()),
+                progress: progress_rx,
+            });
+            b.panel_mut(from.other()).incoming = names.clone();
+        }
+
+        let sources: Vec<PathBuf> = names.iter().map(|n| src_dir.join(n)).collect();
+        let tx = self.events_tx.clone();
+        tokio::spawn(async move {
+            let result = match from {
+                Side::Local => transfer::upload(&endpoint, sources, dest_dir, progress_tx).await,
+                Side::Remote => transfer::download(&endpoint, sources, dest_dir, progress_tx).await,
+            };
+            let result = result.map(|_| format!("copied {what}")).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(AppEvent::TransferDone { server, result }).await;
+        });
     }
 
     /// Positive scrolls back into history; `isize::MIN` returns to following
@@ -686,41 +962,50 @@ impl App {
             .unwrap_or_else(|| format!("{instance:032x}"))
     }
 
+    /// What a confirmed modal asked for. `checked` is its toggle, whatever
+    /// that meant for the pending action.
+    fn confirm_accept(&mut self, pending: Pending, checked: bool) {
+        match pending {
+            Pending::RemoveServer(id) => {
+                let name = self.book.servers.iter().find(|s| s.id == id)
+                    .map(|s| s.name.clone()).unwrap_or_default();
+                self.remove_server(id);
+                self.info(format!("removed '{name}'"));
+            }
+            Pending::KillInstance { server, instance } => {
+                self.spawn_action("kill", server, Action::KillInstance { id: instance });
+            }
+            Pending::RemoveInstance { server, instance } => {
+                // Its screen is about to describe something gone.
+                if self.manage().is_some_and(|m| m.instance == instance) {
+                    self.pop_screen();
+                }
+                self.spawn_action(
+                    "remove instance", server,
+                    Action::RemoveInstance { id: instance, delete_files: checked },
+                );
+            }
+            Pending::Transfer(plan) => self.start_transfer(plan, checked),
+        }
+    }
+
     fn on_key_modal(&mut self, key: KeyEvent) {
+        // Accepting a confirm consumes the modal: a transfer plan moves out.
+        if matches!(self.modal, Some(Modal::Confirm { .. }))
+            && matches!(key.code, KeyCode::Char('y') | KeyCode::Enter) {
+            if let Some(Modal::Confirm { toggle, pending, .. }) = self.modal.take() {
+                self.confirm_accept(pending, toggle.is_some_and(|t| t.value));
+            }
+            return;
+        }
+
         match self.modal.as_mut() {
             Some(Modal::Help) => self.modal = None,
 
-            Some(Modal::Confirm { toggle, pending, .. }) => match key.code {
+            Some(Modal::Confirm { toggle, .. }) => match key.code {
                 KeyCode::Char(' ') => {
                     if let Some(toggle) = toggle {
                         toggle.value = !toggle.value;
-                    }
-                }
-                KeyCode::Char('y') | KeyCode::Enter => {
-                    let delete_files = toggle.as_ref().is_some_and(|t| t.value);
-                    match *pending {
-                        Pending::RemoveServer(id) => {
-                            let name = self.book.servers.iter().find(|s| s.id == id)
-                                .map(|s| s.name.clone()).unwrap_or_default();
-                            self.modal = None;
-                            self.remove_server(id);
-                            self.info(format!("removed '{name}'"));
-                        }
-                        Pending::KillInstance { server, instance } => {
-                            self.modal = None;
-                            self.spawn_action("kill", server, Action::KillInstance { id: instance });
-                        }
-                        Pending::RemoveInstance { server, instance } => {
-                            self.modal = None;
-                            // Its screen is about to describe something gone.
-                            if self.manage().is_some_and(|m| m.instance == instance) {
-                                self.pop_screen();
-                            }
-                            self.spawn_action(
-                                "remove instance", server,
-                                Action::RemoveInstance { id: instance, delete_files },
-                            );
-                        }
                     }
                 }
                 KeyCode::Char('n') | KeyCode::Esc => self.modal = None,
@@ -867,6 +1152,21 @@ impl App {
             }
         }
     }
+}
+
+fn describe(names: &[String]) -> String {
+    match names.len() {
+        1 => format!("'{}'", names[0]),
+        n => format!("{n} items"),
+    }
+}
+
+fn sample(names: &[String]) -> String {
+    let mut text = names.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
+    if names.len() > 4 {
+        text.push_str(&format!(" (+{} more)", names.len() - 4));
+    }
+    text
 }
 
 /// Poll every known server on an interval, or immediately when nudged
