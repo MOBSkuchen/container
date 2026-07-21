@@ -175,6 +175,45 @@ impl Api {
         let entries = transfer::list_dir(&path).await?;
         Ok(Response::DirListing { path, entries })
     }
+
+    async fn upload_archive(&self, dest: PathBuf) -> Result<Response, ApiError> {
+        let dir = transfer::resolve_path(&self.stg, &dest)?;
+        let offer = session::open(self.session_ttl(), move |stream| {
+            transfer::receive_archive(stream, dir)
+        }).await.map_err(|e| ApiError {
+            code: ErrorCode::Internal,
+            msg: format!("opening session listener: {e}"),
+        })?;
+
+        Ok(Response::SessionOpened {
+            port: offer.port,
+            token: offer.token,
+            ttl_secs: offer.ttl_secs,
+            size: None,
+        })
+    }
+
+    async fn download_archive(&self, paths: Vec<PathBuf>) -> Result<Response, ApiError> {
+        if paths.is_empty() {
+            return Err(ApiError { code: ErrorCode::NotFound, msg: "nothing to download".to_string() });
+        }
+        let resolved = paths.iter()
+            .map(|p| transfer::resolve_path(&self.stg, p))
+            .collect::<Result<Vec<_>, _>>()?;
+        let offer = session::open(self.session_ttl(), move |stream| {
+            transfer::send_archive(stream, resolved)
+        }).await.map_err(|e| ApiError {
+            code: ErrorCode::Internal,
+            msg: format!("opening session listener: {e}"),
+        })?;
+
+        Ok(Response::SessionOpened {
+            port: offer.port,
+            token: offer.token,
+            ttl_secs: offer.ttl_secs,
+            size: None,
+        })
+    }
 }
 
 /// Authenticate, dispatch, sign the reply.
@@ -241,6 +280,8 @@ impl Api {
             Action::OpenTerminal { mode } => respond(self.open_terminal(mode).await),
             Action::UploadFile { dest } => respond(self.upload_file(dest).await),
             Action::DownloadFile { src } => respond(self.download_file(src).await),
+            Action::UploadArchive { dest } => respond(self.upload_archive(dest).await),
+            Action::DownloadArchive { paths } => respond(self.download_archive(paths).await),
             Action::ListDir { path } => respond(self.list_dir(path).await),
             Action::TailConsole { id, lines } => {
                 respond(self.manager.tail_console(id, lines as usize).await

@@ -95,6 +95,14 @@ pub enum Action {
     ListDir { path: PathBuf },
     /// The tail of an instance's captured console output, newest last.
     TailConsole { id: u128, lines: u32 },
+    /// Client will push a tar.gz over the returned session; the server
+    /// unpacks it into `dest` and acks only once that has happened.
+    UploadArchive { dest: PathBuf },
+    /// Server packs `paths` (files or whole directories) into a tar.gz and
+    /// streams it over the returned session. Packing happens inside the
+    /// session, so the archive size arrives as the stream's length prefix
+    /// rather than in `SessionOpened`.
+    DownloadArchive { paths: Vec::<PathBuf> },
 }
 
 #[derive(Serialize, Deserialize, Debug)]

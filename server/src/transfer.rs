@@ -103,28 +103,31 @@ pub async fn receive_file(stream: TcpStream, path: PathBuf) {
     }
 }
 
+/// Read one length-prefixed payload into `into`, verifying the byte count.
+async fn receive_payload(stream: &mut TcpStream, into: &Path) -> std::io::Result<()> {
+    let mut len_buf = [0u8; 8];
+    stream.read_exact(&mut len_buf).await?;
+    let len = u64::from_be_bytes(len_buf);
+
+    let mut file = fs::File::create(into).await?;
+    let mut limited = (&mut *stream).take(len);
+    let copied = tokio::io::copy(&mut limited, &mut file).await?;
+    if copied != len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("connection closed after {copied} of {len} bytes"),
+        ));
+    }
+    file.flush().await
+}
+
 async fn receive_inner(mut stream: TcpStream, path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;
     }
 
-    let mut len_buf = [0u8; 8];
-    stream.read_exact(&mut len_buf).await?;
-    let len = u64::from_be_bytes(len_buf);
-
     let part = path.with_extension("part");
-    let received = async {
-        let mut file = fs::File::create(&part).await?;
-        let mut limited = (&mut stream).take(len);
-        let copied = tokio::io::copy(&mut limited, &mut file).await?;
-        if copied != len {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!("connection closed after {copied} of {len} bytes"),
-            ));
-        }
-        file.flush().await
-    }.await;
+    let received = receive_payload(&mut stream, &part).await;
 
     let swapped = match received {
         Ok(()) => async {
@@ -147,4 +150,77 @@ async fn receive_inner(mut stream: TcpStream, path: &Path) -> std::io::Result<()
     }
     let _ = stream.shutdown().await;
     Ok(())
+}
+
+fn tmp_archive_path() -> PathBuf {
+    std::env::temp_dir().join(format!("chld-transfer-{:016x}.tar.gz", rand::random::<u64>()))
+}
+
+/// Session handler: receive a tar.gz and unpack it into `dest`, acking only
+/// after the unpack so the client knows the files exist, not just the bytes.
+pub async fn receive_archive(mut stream: TcpStream, dest: PathBuf) {
+    let tmp = tmp_archive_path();
+    let result = async {
+        fs::create_dir_all(&dest).await?;
+        receive_payload(&mut stream, &tmp).await?;
+        let (archive, into) = (tmp.clone(), dest.clone());
+        tokio::task::spawn_blocking(move || unpack_blocking(&archive, &into))
+            .await
+            .map_err(|e| std::io::Error::other(format!("unpack task panicked: {e}")))?
+    }.await;
+    let _ = fs::remove_file(&tmp).await;
+
+    match result {
+        Ok(()) => {
+            let _ = stream.write_all(&[1u8]).await;
+            let _ = stream.shutdown().await;
+        }
+        Err(e) => eprintln!("archive upload into '{}' failed: {e}", dest.display()),
+    }
+}
+
+fn unpack_blocking(archive: &Path, dest: &Path) -> std::io::Result<()> {
+    let file = std::fs::File::open(archive)?;
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    // The tar crate refuses entries that would escape `dest` on its own.
+    tar.unpack(dest)
+}
+
+/// Session handler: pack `paths` into a tar.gz, then stream it
+/// length-prefixed. Packing happens here rather than during the RPC so a
+/// large tree cannot run into the client's RPC timeout.
+pub async fn send_archive(stream: TcpStream, paths: Vec<PathBuf>) {
+    let tmp = tmp_archive_path();
+    let packed = {
+        let tmp = tmp.clone();
+        tokio::task::spawn_blocking(move || pack_blocking(&paths, &tmp))
+            .await
+            .map_err(|e| std::io::Error::other(format!("pack task panicked: {e}")))
+            .and_then(|r| r)
+    };
+    let result = match packed {
+        Ok(()) => send_inner(stream, &tmp).await,
+        Err(e) => Err(e),
+    };
+    let _ = fs::remove_file(&tmp).await;
+    if let Err(e) = result {
+        eprintln!("archive download failed: {e}");
+    }
+}
+
+/// Entries are named by their final path component, so unpacking yields them
+/// directly inside the destination directory.
+fn pack_blocking(paths: &[PathBuf], tmp: &Path) -> std::io::Result<()> {
+    let file = std::fs::File::create(tmp)?;
+    let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(file, flate2::Compression::default()));
+    for path in paths {
+        let name = path.file_name()
+            .ok_or_else(|| std::io::Error::other(format!("'{}' has no file name", path.display())))?;
+        if path.is_dir() {
+            tar.append_dir_all(name, path)?;
+        } else {
+            tar.append_path_with_name(path, name)?;
+        }
+    }
+    tar.into_inner()?.finish()?.sync_all()
 }

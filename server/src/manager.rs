@@ -397,12 +397,16 @@ impl InstanceManager {
                 cpu_time_ms: s.total_cpu_time.map(|d| d.as_millis() as u64),
                 peak_memory_bytes: s.peak_memory_bytes,
             });
+        // Absolutized so the client can navigate and round-trip it through
+        // the path jail even when the storage path is configured relative.
+        let repo_dir = std::path::absolute(self.stg.repo_dir(id))
+            .unwrap_or_else(|_| self.stg.repo_dir(id));
         Ok(InstanceStatus {
             config: mi.config.clone(),
             repo: mi.repo.clone(),
             run: mi.run_state(),
             stats,
-            repo_dir: self.stg.repo_dir(id),
+            repo_dir,
         })
     }
 
