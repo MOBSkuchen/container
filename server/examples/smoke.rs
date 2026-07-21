@@ -4,6 +4,8 @@
 //!   cargo run --example smoke -- <server-addr>            # full flow
 //!   cargo run --example smoke -- <server-addr> phase2     # after a server
 //!       restart: verify the instance came back via autostart, then clean up.
+//!   cargo run --example smoke -- <server-addr> bootstrap  # handover flow;
+//!       leaves a detached server running (its pid is printed).
 //!
 //! Not the real client product — just enough to exercise every Action.
 
