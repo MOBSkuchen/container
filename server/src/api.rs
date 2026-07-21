@@ -62,6 +62,7 @@ impl Api {
 
     pub async fn stat(&self) -> RR {
         let instances = self.manager.list().await;
+        let bootstrap = self.stg.bootstrap && self.manager.bootstrap_available().await;
 
         let (cpu_usage, total_ram, free_ram) = {
             let mut sys = self.sys.lock().await;
@@ -99,6 +100,7 @@ impl Api {
             network_recv,
             network_trans,
             instances,
+            bootstrap,
         })
     }
 
@@ -256,6 +258,7 @@ impl Api {
                 let config = InstanceConfig {
                     id: 0, // assigned by the manager
                     name, repo_url, branch, command, args, env, autostart, retry_policy,
+                    self_managed: false,
                 };
                 respond(self.manager.create(config).await.map(|id| Response::InstanceCreated { id }))
             }
@@ -276,6 +279,15 @@ impl Api {
             Action::ListInstances => {
                 let list = self.manager.list().await.into_values().collect();
                 Ok(Response::InstanceList(list))
+            }
+            Action::Bootstrap => {
+                if !self.stg.bootstrap {
+                    return respond(Err(ApiError {
+                        code: ErrorCode::AccessDenied,
+                        msg: "bootstrapping is not enabled on this server".to_string(),
+                    }));
+                }
+                respond(self.manager.bootstrap().await.map(|_| Response::Done))
             }
             Action::OpenTerminal { mode } => respond(self.open_terminal(mode).await),
             Action::UploadFile { dest } => respond(self.upload_file(dest).await),

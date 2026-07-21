@@ -133,6 +133,10 @@ struct ManagedInstance {
 
 impl ManagedInstance {
     fn run_state(&self) -> RunState {
+        // The self instance is this very process: answering proves it runs.
+        if self.config.self_managed {
+            return RunState::Running { pids: vec![std::process::id()], restarts: 0 };
+        }
         match &self.service {
             Some(svc) => RunState::from(&*svc.state.borrow()),
             None => RunState::NotRunning,
@@ -141,6 +145,17 @@ impl ManagedInstance {
 
     fn is_active(&self) -> bool {
         self.service.as_ref().is_some_and(|s| !s.state.borrow().is_terminal())
+    }
+
+    /// Refuse operations that make no sense on the server's own entry.
+    fn ensure_not_self(&self) -> Result<(), ApiError> {
+        if self.config.self_managed {
+            return Err(err(
+                ErrorCode::Conflict,
+                "this instance is the server itself — it can only be removed, not operated on",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -169,7 +184,7 @@ impl InstanceManager {
     pub fn new(stg: ServerStg, configs: Vec<InstanceConfig>) -> Arc<Self> {
         let mut instances = HashMap::new();
         for config in configs {
-            let repo = if stg.repo_dir(config.id).exists() {
+            let repo = if config.self_managed || stg.repo_dir(config.id).exists() {
                 RepoState::Ready
             } else {
                 RepoState::CloneFailed("repo directory missing; run UpdateRepo".to_string())
@@ -258,6 +273,7 @@ impl InstanceManager {
             return Err(err(ErrorCode::Conflict, format!("an instance named '{name}' already exists")));
         }
         let mi = instances.get_mut(&id).ok_or_else(|| err(ErrorCode::NotFound, "no such instance"))?;
+        mi.ensure_not_self()?;
 
         let c = &mut mi.config;
         if let Some(v) = patch.name { c.name = v; }
@@ -278,6 +294,7 @@ impl InstanceManager {
         {
             let mut instances = self.instances.lock().await;
             let mi = instances.get_mut(&id).ok_or_else(|| err(ErrorCode::NotFound, "no such instance"))?;
+            mi.ensure_not_self()?;
             if mi.is_active() {
                 return Err(err(ErrorCode::Conflict, "instance is running; stop it before updating the repo"));
             }
@@ -293,6 +310,7 @@ impl InstanceManager {
     pub async fn run(self: &Arc<Self>, id: u128) -> Result<(), ApiError> {
         let mut instances = self.instances.lock().await;
         let mi = instances.get_mut(&id).ok_or_else(|| err(ErrorCode::NotFound, "no such instance"))?;
+        mi.ensure_not_self()?;
 
         match &mi.repo {
             RepoState::Provisioning => return Err(err(ErrorCode::Provisioning, "repo clone still in progress")),
@@ -330,6 +348,7 @@ impl InstanceManager {
         let mut state = {
             let instances = self.instances.lock().await;
             let mi = instances.get(&id).ok_or_else(|| err(ErrorCode::NotFound, "no such instance"))?;
+            mi.ensure_not_self()?;
             let svc = mi.service.as_ref().filter(|_| mi.is_active())
                 .ok_or_else(|| err(ErrorCode::NotRunning, "instance is not running"))?;
             svc.cancel.cancel();
@@ -350,6 +369,7 @@ impl InstanceManager {
     pub async fn kill(&self, id: u128) -> Result<(), ApiError> {
         let instances = self.instances.lock().await;
         let mi = instances.get(&id).ok_or_else(|| err(ErrorCode::NotFound, "no such instance"))?;
+        mi.ensure_not_self()?;
         let svc = mi.service.as_ref().filter(|_| mi.is_active())
             .ok_or_else(|| err(ErrorCode::NotRunning, "instance is not running"))?;
         svc.cancel.cancel();
@@ -399,8 +419,12 @@ impl InstanceManager {
             });
         // Absolutized so the client can navigate and round-trip it through
         // the path jail even when the storage path is configured relative.
-        let repo_dir = std::path::absolute(self.stg.repo_dir(id))
-            .unwrap_or_else(|_| self.stg.repo_dir(id));
+        let repo_dir = if mi.config.self_managed {
+            std::env::current_dir().unwrap_or_default()
+        } else {
+            std::path::absolute(self.stg.repo_dir(id))
+                .unwrap_or_else(|_| self.stg.repo_dir(id))
+        };
         Ok(InstanceStatus {
             config: mi.config.clone(),
             repo: mi.repo.clone(),
@@ -417,6 +441,7 @@ impl InstanceManager {
             name: mi.config.name.clone(),
             repo: mi.repo.clone(),
             run: mi.run_state(),
+            self_managed: mi.config.self_managed,
         })).collect()
     }
 
@@ -435,20 +460,83 @@ impl InstanceManager {
     {
         let instances = self.instances.lock().await;
         let mi = instances.get(&id).ok_or_else(|| err(ErrorCode::NotFound, "no such instance"))?;
+        if mi.config.self_managed {
+            return Err(err(ErrorCode::Conflict, "cannot attach to the server itself — open a shell instead"));
+        }
         let svc = mi.service.as_ref().filter(|_| mi.is_active())
             .ok_or_else(|| err(ErrorCode::NotRunning, "instance is not running"))?;
         Ok((svc.output_tx.subscribe(), svc.stdin.clone()))
     }
 
-    /// The repo dir for an existing instance (used by Shell terminals).
+    /// The repo dir for an existing instance (used by Shell terminals). The
+    /// self instance has no checkout, so it gets the server's working dir.
     pub async fn repo_dir_of(&self, id: u128) -> Result<PathBuf, ApiError> {
         let instances = self.instances.lock().await;
         let mi = instances.get(&id).ok_or_else(|| err(ErrorCode::NotFound, "no such instance"))?;
+        if mi.config.self_managed {
+            return std::env::current_dir()
+                .map_err(|e| err(ErrorCode::Internal, format!("resolving the server's working dir: {e}")));
+        }
         let dir = self.stg.repo_dir(mi.config.id);
         if !dir.exists() {
             return Err(err(ErrorCode::GitError, "instance repo directory does not exist yet"));
         }
         Ok(dir)
+    }
+
+    /// Whether `Bootstrap` would still do something.
+    pub async fn bootstrap_available(&self) -> bool {
+        let instances = self.instances.lock().await;
+        !instances.values().any(|mi| mi.config.self_managed)
+    }
+
+    /// Hand the server over to itself: record a self-managed instance, spawn
+    /// a replacement process (which adopts the entry) and exit shortly after
+    /// — late enough for the RPC reply to reach the client.
+    pub async fn bootstrap(self: &Arc<Self>) -> Result<(), ApiError> {
+        let exe = std::env::current_exe()
+            .map_err(|e| err(ErrorCode::Internal, format!("resolving the server executable: {e}")))?;
+        let config_path = std::path::absolute(&self.stg.config_path)
+            .map_err(|e| err(ErrorCode::Internal, format!("resolving the config path: {e}")))?;
+
+        {
+            let mut instances = self.instances.lock().await;
+            if instances.values().any(|mi| mi.config.self_managed) {
+                return Err(err(ErrorCode::Conflict, "already bootstrapped — the server manages itself"));
+            }
+            let mut name = "server".to_string();
+            if instances.values().any(|mi| mi.config.name == name) {
+                name = format!("server-{:04x}", rand::random::<u16>());
+            }
+            let config = InstanceConfig {
+                id: rand::random::<u128>(),
+                name,
+                repo_url: String::new(),
+                branch: None,
+                command: exe.display().to_string(),
+                args: vec!["-c".to_string(), config_path.display().to_string(), "start".to_string()],
+                env: HashMap::new(),
+                autostart: false,
+                retry_policy: RetryPolicy::Never,
+                self_managed: true,
+            };
+            instances.insert(config.id, ManagedInstance {
+                config, repo: RepoState::Ready, service: None, console: Default::default(),
+            });
+            self.persist(&instances).await?;
+        }
+
+        spawn_replacement(&exe, &config_path, &self.stg.storage_path)
+            .map_err(|e| err(ErrorCode::Internal, format!("spawning the replacement server: {e}")))?;
+
+        let mgr = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            println!("bootstrapped — handing over to the replacement server");
+            mgr.shutdown_all().await;
+            std::process::exit(0);
+        });
+        Ok(())
     }
 
     /// Stop everything, in parallel. Called on server shutdown.
@@ -464,6 +552,30 @@ impl InstanceManager {
         });
         futures::future::join_all(futures).await;
     }
+}
+
+/// Start the replacement server, detached from us: it must survive this
+/// process (and on Windows, this console) going away. `CHLD_TAKEOVER` makes
+/// it wait for our listener to free the port. Its output goes to a log file
+/// in the storage dir — a detached process has no console to write to.
+fn spawn_replacement(exe: &Path, config_path: &Path, storage: &Path) -> std::io::Result<()> {
+    let log = std::fs::OpenOptions::new()
+        .create(true).append(true)
+        .open(storage.join("server.log"))?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("-c").arg(config_path).arg("start")
+        .env("CHLD_TAKEOVER", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    cmd.spawn().map(|_| ())
 }
 
 fn build_command(config: &InstanceConfig, repo_dir: &Path) -> Command {

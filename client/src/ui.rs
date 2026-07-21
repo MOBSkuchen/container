@@ -199,6 +199,9 @@ fn server_summary(state: &ServerState, addr: String) -> String {
 /// Glyph, one-line label and colour for an instance, repo state taking
 /// precedence: a half-cloned instance cannot meaningfully be "stopped".
 fn instance_status(inst: &InstanceStatResponse) -> (&'static str, String, Style) {
+    if inst.self_managed {
+        return ("◈", "this server".to_string(), Style::new().fg(Color::Green));
+    }
     match &inst.repo {
         RepoState::Provisioning => return ("⋯", "cloning…".to_string(), Style::new().fg(ACCENT)),
         RepoState::CloneFailed(e) => return ("✗", format!("clone failed: {}", first_line(e)), Style::new().fg(Color::Red)),
@@ -412,15 +415,19 @@ fn detail_lines(app: &App, manage: &Manage, detail: &InstanceStatus) -> Vec<Line
     let config = &detail.config;
     let mut lines = Vec::new();
 
-    let branch = config.branch.clone().unwrap_or_else(|| "default branch".to_string());
-    lines.push(field("repo", format!("{} ({branch})", config.repo_url)));
+    if config.self_managed {
+        lines.push(styled_field("repo", "this server manages itself".to_string(), Style::new().fg(ACCENT)));
+    } else {
+        let branch = config.branch.clone().unwrap_or_else(|| "default branch".to_string());
+        lines.push(field("repo", format!("{} ({branch})", config.repo_url)));
 
-    let (repo_label, repo_style) = match &detail.repo {
-        RepoState::Ready => ("ready".to_string(), Style::new().fg(Color::Green)),
-        RepoState::Provisioning => ("cloning…".to_string(), Style::new().fg(ACCENT)),
-        RepoState::CloneFailed(e) => (format!("clone failed: {e}"), Style::new().fg(Color::Red)),
-    };
-    lines.push(styled_field("checkout", repo_label, repo_style));
+        let (repo_label, repo_style) = match &detail.repo {
+            RepoState::Ready => ("ready".to_string(), Style::new().fg(Color::Green)),
+            RepoState::Provisioning => ("cloning…".to_string(), Style::new().fg(ACCENT)),
+            RepoState::CloneFailed(e) => (format!("clone failed: {e}"), Style::new().fg(Color::Red)),
+        };
+        lines.push(styled_field("checkout", repo_label, repo_style));
+    }
 
     let command = if config.args.is_empty() {
         config.command.clone()

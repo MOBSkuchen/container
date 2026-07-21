@@ -95,6 +95,10 @@ pub enum Action {
     ListDir { path: PathBuf },
     /// The tail of an instance's captured console output, newest last.
     TailConsole { id: u128, lines: u32 },
+    /// Hand the server over to itself: it records a self-managed instance,
+    /// spawns a replacement process and exits. Only honored when the server
+    /// config enables bootstrapping.
+    Bootstrap,
     /// Client will push a tar.gz over the returned session; the server
     /// unpacks it into `dest` and acks only once that has happened.
     UploadArchive { dest: PathBuf },
@@ -123,6 +127,10 @@ pub enum Response {
         cpu_usage: f64,
 
         instances: HashMap::<u128, InstanceStatResponse>,
+
+        /// Whether `Bootstrap` would be honored right now (enabled in the
+        /// server config and not already done).
+        bootstrap: bool,
     },
     InstanceCreated { id: u128 },
     InstanceStatus(InstanceStatus),

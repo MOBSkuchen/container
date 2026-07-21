@@ -172,6 +172,7 @@ pub enum Pending {
     KillInstance { server: u128, instance: u128 },
     RemoveInstance { server: u128, instance: u128 },
     Transfer(TransferPlan),
+    Bootstrap(u128),
 }
 
 #[derive(Clone, Copy)]
@@ -244,6 +245,9 @@ pub struct App {
     pub should_quit: bool,
     /// A shell/attach request the run loop hands back to `main` to execute.
     pub pending_session: Option<SessionRequest>,
+    /// Servers added this session: the first poll that says they support
+    /// bootstrapping triggers a one-time offer.
+    bootstrap_offers: HashSet<u128>,
 
     config_path: PathBuf,
     book_tx: watch::Sender<Book>,
@@ -263,6 +267,7 @@ impl App {
         Self {
             book, states, screens: vec![Screen::Landing], cursor: 0,
             modal: None, toast: None, should_quit: false, pending_session: None,
+            bootstrap_offers: HashSet::new(),
             config_path, book_tx, refresh, events_tx,
         }
     }
@@ -368,6 +373,7 @@ impl App {
     fn add_server(&mut self, name: String, addr: SocketAddr) {
         let entry = ServerEntry::new(name, addr);
         self.states.insert(entry.id, ServerState::default());
+        self.bootstrap_offers.insert(entry.id);
         self.book.servers.push(entry);
         self.publish_servers();
         self.refresh.notify_one();
@@ -438,6 +444,7 @@ impl App {
                 }
                 self.clamp_cursor();
                 self.sync_manage(server);
+                self.offer_bootstrap(server);
             }
             AppEvent::Detail { server, instance, result } => {
                 // A late reply for an instance we have since navigated away
@@ -962,6 +969,34 @@ impl App {
             .unwrap_or_else(|| format!("{instance:032x}"))
     }
 
+    /// Offer bootstrapping once for a freshly added server that supports it.
+    /// Waits its turn if a modal is already up — the offer keeps until then.
+    fn offer_bootstrap(&mut self, server: u128) {
+        if !self.bootstrap_offers.contains(&server) {
+            return;
+        }
+        let Some(vitals) = self.states.get(&server).and_then(|s| s.vitals.as_ref()) else { return };
+        if !vitals.bootstrap {
+            self.bootstrap_offers.remove(&server);
+            return;
+        }
+        if self.modal.is_some() {
+            return;
+        }
+        self.bootstrap_offers.remove(&server);
+        let name = self.entry(server).map(|e| e.name.clone()).unwrap_or_default();
+        self.modal = Some(Modal::Confirm {
+            title: "Bootstrap server".to_string(),
+            message: format!(
+                "'{name}' supports bootstrapping: it can hand itself over and run \
+                 as an instance under its own management.\n\
+                 The server restarts once, then appears in its own instance list.",
+            ),
+            toggle: None,
+            pending: Pending::Bootstrap(server),
+        });
+    }
+
     /// What a confirmed modal asked for. `checked` is its toggle, whatever
     /// that meant for the pending action.
     fn confirm_accept(&mut self, pending: Pending, checked: bool) {
@@ -986,6 +1021,9 @@ impl App {
                 );
             }
             Pending::Transfer(plan) => self.start_transfer(plan, checked),
+            Pending::Bootstrap(server) => {
+                self.spawn_action("bootstrap", server, Action::Bootstrap);
+            }
         }
     }
 

@@ -240,13 +240,92 @@ async fn main() {
     let mut args = std::env::args().skip(1);
     let addr = SocketAddr::from_str(&args.next().unwrap_or("127.0.0.1:5000".to_string()))
         .expect("bad server address");
-    let phase2 = args.next().as_deref() == Some("phase2");
-
-    if phase2 {
-        run_phase2(addr).await;
-    } else {
-        run_full(addr).await;
+    match args.next().as_deref() {
+        Some("phase2") => run_phase2(addr).await,
+        Some("bootstrap") => run_bootstrap(addr).await,
+        _ => run_full(addr).await,
     }
+}
+
+/// A ping that tolerates the server being mid-handover.
+async fn try_ping(addr: SocketAddr) -> bool {
+    let payload = auth::encode(&Action::Ping).await.unwrap();
+    let request = auth::sign_request(&key(), payload);
+    let nonce = request.nonce.clone();
+    let Ok(mut client) = RpcClient::<Request>::new(addr).await else { return false };
+    let Ok(reply) = client.call::<Reply>(request).await else { return false };
+    let Ok(payload) = auth::verify_reply(&key(), &nonce, &reply) else { return false };
+    matches!(auth::decode::<Response>(payload).await, Ok(Response::Pong))
+}
+
+async fn stat_bootstrap(addr: SocketAddr) -> bool {
+    match call(addr, Action::Stat).await {
+        Response::StatResponse { bootstrap, .. } => bootstrap,
+        other => panic!("expected StatResponse, got {other:?}"),
+    }
+}
+
+/// Bootstrap handover: the server replaces itself with a self-managed copy.
+/// Leaves a detached server running; its pid is printed for cleanup.
+async fn run_bootstrap(addr: SocketAddr) {
+    assert!(stat_bootstrap(addr).await, "bootstrap is not advertised as available");
+    match call(addr, Action::Bootstrap).await {
+        Response::Done => println!("OK   bootstrap accepted"),
+        other => panic!("bootstrap failed: {other:?}"),
+    }
+
+    // The old process drains and exits; the replacement takes the port over.
+    let mut up = false;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if try_ping(addr).await {
+            up = true;
+            break;
+        }
+    }
+    assert!(up, "the replacement server did not come up within 30s");
+    println!("OK   replacement server is answering");
+
+    let list = match call(addr, Action::ListInstances).await {
+        Response::InstanceList(list) => list,
+        other => panic!("expected InstanceList, got {other:?}"),
+    };
+    let me = list.iter().find(|i| i.self_managed).expect("no self-managed instance listed");
+    let RunState::Running { ref pids, .. } = me.run else {
+        panic!("self instance is not running: {:?}", me.run);
+    };
+    println!("OK   self instance '{}' listed as running (pid {})", me.name, pids[0]);
+
+    assert!(!stat_bootstrap(addr).await, "bootstrap still advertised after the handover");
+    println!("OK   bootstrap no longer advertised");
+
+    expect_err(&call(addr, Action::StopInstance { id: me.id }).await, ErrorCode::Conflict, "stop the self instance");
+    expect_err(&call(addr, Action::KillInstance { id: me.id }).await, ErrorCode::Conflict, "kill the self instance");
+    expect_err(&call(addr, Action::UpdateRepo { id: me.id }).await, ErrorCode::Conflict, "update-repo on the self instance");
+    expect_err(
+        &call(addr, Action::OpenTerminal { mode: TerminalMode::Attach(me.id) }).await,
+        ErrorCode::Conflict, "attach to the self instance",
+    );
+    expect_err(&call(addr, Action::Bootstrap).await, ErrorCode::Conflict, "double bootstrap");
+
+    match call(addr, Action::CheckInstance { id: me.id }).await {
+        Response::InstanceStatus(st) => {
+            assert!(st.config.self_managed, "check lost the self flag");
+            assert!(st.repo_dir.is_absolute(), "self repo_dir is not absolute");
+            println!("OK   check on the self instance (dir {})", st.repo_dir.display());
+        }
+        other => panic!("check failed: {other:?}"),
+    }
+
+    // Un-bootstrap: the entry is removable, and the offer comes back.
+    match call(addr, Action::RemoveInstance { id: me.id, delete_files: false }).await {
+        Response::Done => println!("OK   self instance removed (un-bootstrap)"),
+        other => panic!("remove failed: {other:?}"),
+    }
+    assert!(stat_bootstrap(addr).await, "bootstrap not advertised again after un-bootstrap");
+    println!("OK   bootstrap advertised again");
+
+    println!("\nbootstrap flow passed — the detached server (pid {}) is still running", pids[0]);
 }
 
 /// After a server restart: the autostart instance must be running again.

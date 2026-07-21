@@ -64,6 +64,9 @@ pub struct InstanceConfig {
     pub env: HashMap<String, String>,
     pub autostart: bool,
     pub retry_policy: RetryPolicy,
+    /// This instance *is* the server process (created by `Bootstrap`). It is
+    /// reported as running rather than supervised, and cannot be operated on.
+    pub self_managed: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -100,4 +103,5 @@ pub struct InstanceStatResponse {
     pub name: String,
     pub repo: RepoState,
     pub run: RunState,
+    pub self_managed: bool,
 }

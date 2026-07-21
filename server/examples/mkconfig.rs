@@ -19,7 +19,8 @@ async fn main() {
     let roots: Vec<PathBuf> = args.map(PathBuf::from).collect();
 
     let key = auth::hash_or_random(Some(phrase.as_str()).filter(|p| !p.is_empty())).to_vec();
-    ServerStg::new(addr, config, storage, roots, 30, default_shell(), key)
+    // Test configs allow bootstrapping so smoke can exercise it.
+    ServerStg::new(addr, config, storage, roots, 30, default_shell(), key, true)
         .await
         .expect("init failed");
     println!("config written");

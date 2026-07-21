@@ -19,6 +19,7 @@ async fn _init(config_file: PathBuf) -> anyhow::Result<()> {
     let file_roots: String = gather_value_routine(&term, "File roots (';'-separated, empty for none): ", Some(String::new()))?;
     let session_ttl_secs: u64 = gather_value_routine(&term, "Session TTL (seconds): ", Some(30))?;
     let shell: String = gather_value_routine(&term, "Terminal shell: ", Some(default_shell()))?;
+    let bootstrap: bool = gather_value_routine(&term, "Allow bootstrapping (true/false): ", Some(false))?;
 
     let file_roots: Vec<PathBuf> = file_roots
         .split(';')
@@ -38,6 +39,7 @@ async fn _init(config_file: PathBuf) -> anyhow::Result<()> {
         session_ttl_secs,
         shell,
         key,
+        bootstrap,
     ).await?;
 
     term.write_line(format!("Initialized to {:#?}", server_stg.config_path).as_str())?;
@@ -94,14 +96,29 @@ async fn _start(config_path: PathBuf) -> anyhow::Result<()> {
     use anyhow::Context;
     let (stg, instances) = ServerStg::load(config_path.clone()).await
         .with_context(|| format!("loading config '{}' (run `init` first?)", config_path.display()))?;
+
+    // Spawned by a bootstrapping predecessor: it is still draining, so wait
+    // for it to release the address before claiming it.
+    if std::env::var_os("CHLD_TAKEOVER").is_some() {
+        for _ in 0..40 {
+            match tokio::net::TcpListener::bind(stg.addr).await {
+                Ok(probe) => { drop(probe); break }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+            }
+        }
+    }
+
     let manager = InstanceManager::new(stg.clone(), instances);
-    manager.autostart().await;
     let handler = Api::new(stg.clone(), manager.clone());
 
     println!("Starting server on {}", stg.addr);
     let server = RpcServer::<Request, Reply, _>::new(stg.addr, handler)
         .await
         .map_err(|e| anyhow::anyhow!("failed to bind {}: {:?}", stg.addr, e))?;
+
+    // After the bind: during a takeover the predecessor may still be
+    // stopping the very instances autostart would launch.
+    manager.autostart().await;
 
     tokio::select! {
         _ = server.run(4) => {}
