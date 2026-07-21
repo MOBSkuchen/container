@@ -148,6 +148,35 @@ pub enum Pending {
     RemoveInstance { server: u128, instance: u128 },
 }
 
+#[derive(Clone, Copy)]
+pub enum SessionKind {
+    Shell,
+    Attach,
+}
+
+impl SessionKind {
+    pub fn verb(self) -> &'static str {
+        match self {
+            SessionKind::Shell => "shell",
+            SessionKind::Attach => "attach",
+        }
+    }
+}
+
+/// Everything the session runner needs once the TUI has stepped aside.
+pub struct SessionRequest {
+    pub kind: SessionKind,
+    pub endpoint: Endpoint,
+    pub instance: u128,
+    pub label: String,
+}
+
+/// Why `run` returned: for good, or to lend the console to a session.
+pub enum RunOutcome {
+    Quit,
+    Session(SessionRequest),
+}
+
 pub struct ConfirmToggle {
     pub label: String,
     pub value: bool,
@@ -187,6 +216,8 @@ pub struct App {
     pub modal: Option<Modal>,
     pub toast: Option<Toast>,
     pub should_quit: bool,
+    /// A shell/attach request the run loop hands back to `main` to execute.
+    pub pending_session: Option<SessionRequest>,
 
     config_path: PathBuf,
     book_tx: watch::Sender<Book>,
@@ -205,7 +236,7 @@ impl App {
         let states = book.servers.iter().map(|s| (s.id, ServerState::default())).collect();
         Self {
             book, states, screens: vec![Screen::Landing], cursor: 0,
-            modal: None, toast: None, should_quit: false,
+            modal: None, toast: None, should_quit: false, pending_session: None,
             config_path, book_tx, refresh, events_tx,
         }
     }
@@ -523,8 +554,24 @@ impl App {
             KeyCode::Char('D') => self.confirm_remove_instance(server, instance),
             KeyCode::Char('e') => self.open_instance_form(server, Some(instance)),
             KeyCode::Char('n') => self.open_instance_form(server, None),
+            KeyCode::Char('s') => self.request_session(SessionKind::Shell),
+            KeyCode::Char('a') => self.request_session(SessionKind::Attach),
             _ => {}
         }
+    }
+
+    /// Hand the console over to a shell/attach session on the managed
+    /// instance. The run loop returns it to `main`, which owns the terminal.
+    fn request_session(&mut self, kind: SessionKind) {
+        let Some(m) = self.manage() else { return };
+        let (server, instance) = (m.server, m.instance);
+        let Some(endpoint) = self.endpoint(server) else { return };
+        let label = format!(
+            "{}/{}",
+            self.entry(server).map(|e| e.name.clone()).unwrap_or_default(),
+            self.instance_name(server, instance),
+        );
+        self.pending_session = Some(SessionRequest { kind, endpoint, instance, label });
     }
 
     /// Positive scrolls back into history; `isize::MIN` returns to following
@@ -776,12 +823,15 @@ impl App {
 
     /// Generic over backend and input source so a headless driver can supply
     /// a `TestBackend` and a scripted key stream.
+    ///
+    /// Borrows rather than consumes: a `Session` return suspends the TUI and
+    /// the same app (and event channel) resumes afterwards.
     pub async fn run<B, I>(
-        mut self,
+        &mut self,
         terminal: &mut Terminal<B>,
-        mut events: mpsc::Receiver<AppEvent>,
-        mut input: I,
-    ) -> anyhow::Result<()>
+        events: &mut mpsc::Receiver<AppEvent>,
+        input: &mut I,
+    ) -> anyhow::Result<RunOutcome>
     where
         B: Backend,
         B::Error: std::error::Error + Send + Sync + 'static,
@@ -795,7 +845,7 @@ impl App {
                 && Instant::now() >= toast.until {
                 self.toast = None;
             }
-            terminal.draw(|frame| ui::draw(frame, &self))?;
+            terminal.draw(|frame| ui::draw(frame, self))?;
 
             tokio::select! {
                 Some(event) = events.recv() => self.on_event(event),
@@ -810,7 +860,10 @@ impl App {
             }
 
             if self.should_quit {
-                return Ok(());
+                return Ok(RunOutcome::Quit);
+            }
+            if let Some(request) = self.pending_session.take() {
+                return Ok(RunOutcome::Session(request));
             }
         }
     }

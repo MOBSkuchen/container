@@ -6,7 +6,7 @@ use crossterm::event::EventStream;
 use protocol::auth;
 use tokio::sync::{mpsc, watch, Notify};
 
-use client::app::{self, App};
+use client::app::{self, App, RunOutcome, SessionKind, SessionRequest};
 use client::book::{self, Book};
 use client::{target, terminal};
 
@@ -124,7 +124,7 @@ async fn keygen(
 
 async fn tui(book: Book, config_path: PathBuf) -> anyhow::Result<()> {
     let (book_tx, book_rx) = watch::channel(book.clone());
-    let (events_tx, events_rx) = mpsc::channel(64);
+    let (events_tx, mut events_rx) = mpsc::channel(64);
     let refresh = Arc::new(Notify::new());
 
     app::spawn_poller(book_rx, events_tx.clone(), refresh.clone());
@@ -132,8 +132,32 @@ async fn tui(book: Book, config_path: PathBuf) -> anyhow::Result<()> {
     // `init` installs a panic hook that restores the terminal, so a crash
     // cannot leave the console in raw mode.
     let mut terminal = ratatui::init();
-    let app = App::new(book, config_path, book_tx, refresh, events_tx);
-    let result = app.run(&mut terminal, events_rx, EventStream::new()).await;
+    let mut app = App::new(book, config_path, book_tx, refresh, events_tx);
+    let result = loop {
+        // Rebuilt per lap: a session runs its own EventStream, and two live
+        // ones would compete for the same console events.
+        let mut input = EventStream::new();
+        match app.run(&mut terminal, &mut events_rx, &mut input).await {
+            Ok(RunOutcome::Quit) => break Ok(()),
+            Ok(RunOutcome::Session(request)) => {
+                drop(input);
+                ratatui::restore();
+                let outcome = run_session(&request).await;
+                terminal = ratatui::init();
+                if let Err(e) = outcome {
+                    app.error(format!("{} on {}: {e:#}", request.kind.verb(), request.label));
+                }
+            }
+            Err(e) => break Err(e),
+        }
+    };
     ratatui::restore();
     result
+}
+
+async fn run_session(request: &SessionRequest) -> anyhow::Result<()> {
+    match request.kind {
+        SessionKind::Shell => terminal::shell(&request.endpoint, request.instance, &request.label).await,
+        SessionKind::Attach => terminal::attach(&request.endpoint, request.instance, &request.label).await,
+    }
 }

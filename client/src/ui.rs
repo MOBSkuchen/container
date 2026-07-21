@@ -438,15 +438,19 @@ fn detail_lines(app: &App, manage: &Manage, detail: &InstanceStatus) -> Vec<Line
         lines.push(field("env", instance_form::fmt_env(&config.env)));
     }
 
-    // Terminals are a CLI mode, so the screen's job is to hand over the
-    // exact command rather than to open one.
     let label = format!(
         "{}/{}",
         app.entry(manage.server).map(|e| e.name.clone()).unwrap_or_default(),
         config.name,
     );
     lines.push(Line::raw(""));
-    lines.push(Line::styled("terminals — run in another console", Style::new().fg(DIM)));
+    lines.push(Line::from(vec![
+        Span::styled("terminals — ", Style::new().fg(DIM)),
+        Span::styled("s", Style::new().fg(ACCENT)),
+        Span::styled(" shell · ", Style::new().fg(DIM)),
+        Span::styled("a", Style::new().fg(ACCENT)),
+        Span::styled(" attach, or from another console:", Style::new().fg(DIM)),
+    ]));
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(format!("client shell {label}"), Style::new().fg(ACCENT)),
@@ -534,8 +538,8 @@ const LANDING_KEYS: &[(&str, &str)] = &[
 
 const MANAGE_KEYS: &[(&str, &str)] = &[
     ("↑↓", "instance"), ("pgup/pgdn", "console"), ("r", "start"), ("x", "stop"),
-    ("k", "kill"), ("u", "update repo"), ("e", "edit"), ("D", "remove"),
-    ("?", "help"), ("esc", "back"),
+    ("k", "kill"), ("u", "update repo"), ("s", "shell"), ("a", "attach"),
+    ("e", "edit"), ("D", "remove"), ("?", "help"), ("esc", "back"),
 ];
 
 fn draw_keys(frame: &mut Frame, area: Rect, keys: &[(&str, &str)]) {
@@ -688,6 +692,8 @@ fn draw_help(frame: &mut Frame, app: &App) {
             ("x", "stop, with a grace period"),
             ("k", "kill, no grace period"),
             ("u", "re-clone the repo — the instance must be stopped"),
+            ("s", "open a shell in the checkout (the TUI steps aside)"),
+            ("a", "attach to the running process (the TUI steps aside)"),
             ("e", "edit this instance's configuration"),
             ("n", "create another instance on this server"),
             ("D", "remove this instance from the server"),
@@ -698,7 +704,7 @@ fn draw_help(frame: &mut Frame, app: &App) {
     let footer: &[&str] = match app.screen() {
         Screen::Landing => &["Servers are polled every 2s."],
         Screen::Manage(_) => &[
-            "Terminals are separate commands, run in another console:",
+            "Terminals also run as commands in another console:",
             "  client shell <server>/<instance>    a new shell in the checkout",
             "  client attach <server>/<instance>   the running process",
             "Ctrl+C ends a session; an attached instance keeps running.",
