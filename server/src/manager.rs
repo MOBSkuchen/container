@@ -152,7 +152,7 @@ impl ManagedInstance {
         if self.config.self_managed {
             return Err(err(
                 ErrorCode::Conflict,
-                "this instance is the server itself — it can only be removed, not operated on",
+                "this instance is the server itself — it can only be restarted or removed",
             ));
         }
         Ok(())
@@ -566,13 +566,40 @@ impl InstanceManager {
             self.persist(&instances).await?;
         }
 
+        self.hand_over()
+    }
+
+    /// Stop (if running) and start again — or, on the self instance, hand the
+    /// whole server over to a fresh copy of itself.
+    pub async fn restart(self: &Arc<Self>, id: u128) -> Result<(), ApiError> {
+        let (is_self, active) = {
+            let instances = self.instances.lock().await;
+            let mi = instances.get(&id).ok_or_else(|| err(ErrorCode::NotFound, "no such instance"))?;
+            (mi.config.self_managed, mi.is_active())
+        };
+        if is_self {
+            return self.hand_over();
+        }
+        if active {
+            self.stop(id).await?;
+        }
+        self.run(id).await
+    }
+
+    /// Spawn a replacement server process and exit once the RPC reply has had
+    /// a moment to flush. The replacement adopts the persisted state.
+    fn hand_over(self: &Arc<Self>) -> Result<(), ApiError> {
+        let exe = std::env::current_exe()
+            .map_err(|e| err(ErrorCode::Internal, format!("resolving the server executable: {e}")))?;
+        let config_path = std::path::absolute(&self.stg.config_path)
+            .map_err(|e| err(ErrorCode::Internal, format!("resolving the config path: {e}")))?;
         spawn_replacement(&exe, &config_path, &self.stg.storage_path)
             .map_err(|e| err(ErrorCode::Internal, format!("spawning the replacement server: {e}")))?;
 
         let mgr = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
-            println!("bootstrapped — handing over to the replacement server");
+            println!("handing over to the replacement server");
             mgr.shutdown_all().await;
             std::process::exit(0);
         });
@@ -618,8 +645,58 @@ fn spawn_replacement(exe: &Path, config_path: &Path, storage: &Path) -> std::io:
     cmd.spawn().map(|_| ())
 }
 
-fn build_command(config: &InstanceConfig, repo_dir: &Path) -> Command {
-    Command::new(&config.command)
+/// What a bare-name command actually resolves to, shell-style, preferring a
+/// PATH set in the instance's own env over the server's. Left to the spawn
+/// layer, resolution would use only the *server's* PATH — which after a
+/// bootstrap handover is frozen at whatever environment the original launch
+/// had, the classic "right version in the shell, wrong one in the instance".
+fn resolved_program(config: &InstanceConfig) -> PathBuf {
+    let name = &config.command;
+    if name.contains('/') || name.contains('\\') {
+        return PathBuf::from(name);
+    }
+    let path_var = config.env.iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| std::ffi::OsString::from(value))
+        .or_else(|| std::env::var_os("PATH"));
+    let exts: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+            .split(';').filter(|e| !e.is_empty()).map(str::to_string).collect()
+    } else {
+        Vec::new()
+    };
+    path_var
+        .and_then(|path_var| find_program(name, &path_var, &exts))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// PATHEXT-aware search of `path_var` for `name`.
+fn find_program(name: &str, path_var: &std::ffi::OsStr, exts: &[String]) -> Option<PathBuf> {
+    // An extension-less name never matches exactly on Windows — a stray
+    // extension-less file would shadow the PATHEXT search.
+    let try_exact = exts.is_empty() || name.contains('.');
+    for dir in std::env::split_paths(path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        if try_exact {
+            let exact = dir.join(name);
+            if exact.is_file() {
+                return Some(exact);
+            }
+        }
+        for ext in exts {
+            let candidate = dir.join(format!("{name}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn build_command(config: &InstanceConfig, program: &Path, repo_dir: &Path) -> Command {
+    Command::new(program.as_os_str())
         .args(&config.args)
         .envs(config.env.iter())
         .current_dir(repo_dir)
@@ -640,7 +717,8 @@ async fn supervise(
     console: Arc<std::sync::Mutex<Console>>,
 ) {
     let mut restarts: u32 = 0;
-    let cmd = build_command(&config, &repo_dir);
+    let program = resolved_program(&config);
+    let cmd = build_command(&config, &program, &repo_dir);
     let note = |text: String| console.lock().unwrap_or_else(|e| e.into_inner()).note(text);
 
     loop {
@@ -662,8 +740,10 @@ async fn supervise(
                 return;
             }
         };
+        // The resolved path in the marker is the answer to "which java did
+        // this actually run?" — visible without shell access.
         note(if restarts == 0 {
-            "started".to_string()
+            format!("started `{}`", program.display())
         } else {
             format!("restarted (attempt {})", restarts + 1)
         });
@@ -747,5 +827,31 @@ async fn supervise(
             }
             _ = tokio::time::sleep(delay) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_program;
+
+    #[test]
+    fn resolves_via_pathext_and_reports_misses() {
+        let dir = std::env::temp_dir().join(format!("chld-find-{:08x}", rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tool.exe"), b"x").unwrap();
+        let path_var = std::env::join_paths([&dir]).unwrap();
+
+        // The resolved extension's case follows the PATHEXT entry.
+        let exts = [".com".to_string(), ".exe".to_string()];
+        assert_eq!(find_program("tool", &path_var, &exts), Some(dir.join("tool.exe")));
+        assert_eq!(find_program("tool.exe", &path_var, &exts), Some(dir.join("tool.exe")));
+        assert_eq!(find_program("missing", &path_var, &exts), None);
+        // Extension-less names must not match a file without extension on
+        // Windows-style lookups; they do with no PATHEXT in play.
+        std::fs::write(dir.join("tool"), b"x").unwrap();
+        assert_eq!(find_program("tool", &path_var, &exts), Some(dir.join("tool.exe")));
+        assert_eq!(find_program("tool", &path_var, &[]), Some(dir.join("tool")));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
