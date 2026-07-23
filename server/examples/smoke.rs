@@ -249,15 +249,19 @@ async fn main() {
     }
 }
 
-/// A ping that tolerates the server being mid-handover.
-async fn try_ping(addr: SocketAddr) -> bool {
-    let payload = auth::encode(&Action::Ping).await.unwrap();
+/// A call that tolerates the server being mid-handover.
+async fn try_call(addr: SocketAddr, action: Action) -> Option<Response> {
+    let payload = auth::encode(&action).await.ok()?;
     let request = auth::sign_request(&key(), payload);
     let nonce = request.nonce.clone();
-    let Ok(mut client) = RpcClient::<Request>::new(addr).await else { return false };
-    let Ok(reply) = client.call::<Reply>(request).await else { return false };
-    let Ok(payload) = auth::verify_reply(&key(), &nonce, &reply) else { return false };
-    matches!(auth::decode::<Response>(payload).await, Ok(Response::Pong))
+    let mut client = RpcClient::<Request>::new(addr).await.ok()?;
+    let reply = client.call::<Reply>(request).await.ok()?;
+    let payload = auth::verify_reply(&key(), &nonce, &reply).ok()?;
+    auth::decode::<Response>(payload).await.ok()
+}
+
+async fn try_ping(addr: SocketAddr) -> bool {
+    matches!(try_call(addr, Action::Ping).await, Some(Response::Pong))
 }
 
 async fn stat_bootstrap(addr: SocketAddr) -> bool {
@@ -319,15 +323,36 @@ async fn run_bootstrap(addr: SocketAddr) {
         other => panic!("check failed: {other:?}"),
     }
 
+    // Restarting the self instance replaces the whole server.
+    let (self_id, old_pid) = (me.id, pids[0]);
+    match call(addr, Action::RestartInstance { id: self_id }).await {
+        Response::Done => {}
+        other => panic!("self restart failed: {other:?}"),
+    }
+    let mut new_pid = None;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Some(Response::InstanceList(list)) = try_call(addr, Action::ListInstances).await
+            && let Some(me) = list.iter().find(|i| i.self_managed)
+            && let RunState::Running { ref pids, .. } = me.run
+            && let Some(pid) = pids.first().copied()
+            && pid != old_pid {
+            new_pid = Some(pid);
+            break;
+        }
+    }
+    let new_pid = new_pid.expect("no replacement server with a fresh pid within 30s");
+    println!("OK   restart of the self instance replaced the server (pid {old_pid} → {new_pid})");
+
     // Un-bootstrap: the entry is removable, and the offer comes back.
-    match call(addr, Action::RemoveInstance { id: me.id, delete_files: false }).await {
+    match call(addr, Action::RemoveInstance { id: self_id, delete_files: false }).await {
         Response::Done => println!("OK   self instance removed (un-bootstrap)"),
         other => panic!("remove failed: {other:?}"),
     }
     assert!(stat_bootstrap(addr).await, "bootstrap not advertised again after un-bootstrap");
     println!("OK   bootstrap advertised again");
 
-    println!("\nbootstrap flow passed — the detached server (pid {}) is still running", pids[0]);
+    println!("\nbootstrap flow passed — the detached server (pid {new_pid}) is still running");
 }
 
 /// After a server restart: the autostart instance must be running again.
@@ -458,7 +483,10 @@ async fn run_full(addr: SocketAddr) {
         Response::Console { lines, dropped } => {
             let text = lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
             assert!(text.contains("instance-started"), "console missed the startup output:\n{text}");
-            assert!(text.contains("── started ──"), "console missed the start marker:\n{text}");
+            // The marker names the resolved executable, so "which binary ran"
+            // is answerable from the console alone.
+            assert!(text.contains("── started `"), "console missed the start marker:\n{text}");
+            assert!(text.to_lowercase().contains("cmd.exe`"), "start marker lacks the resolved path:\n{text}");
             assert_eq!(dropped, 0, "nothing should have been dropped yet");
             assert!(lines.iter().all(|l| l.at_ms > 0), "console lines carry no timestamp");
             println!("OK   console captured {} lines with nobody attached", lines.len());
@@ -526,6 +554,32 @@ async fn run_full(addr: SocketAddr) {
     assert!(closed.is_ok(), "the session did not close after `exit`");
     println!("OK   shell terminal (`exit` closes the session)");
     drop(shell);
+
+    // 4b. Restart: same instance, fresh process.
+    let old_pid = match call(addr, Action::CheckInstance { id }).await {
+        Response::InstanceStatus(st) => match st.run {
+            RunState::Running { ref pids, .. } => pids.first().copied(),
+            other => panic!("expected Running before restart, got {other:?}"),
+        },
+        other => panic!("check failed: {other:?}"),
+    };
+    match call(addr, Action::RestartInstance { id }).await {
+        Response::Done => {}
+        other => panic!("restart failed: {other:?}"),
+    }
+    let mut new_pid = None;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Response::InstanceStatus(st) = call(addr, Action::CheckInstance { id }).await
+            && let RunState::Running { pids, .. } = st.run
+            && let Some(pid) = pids.first().copied()
+            && Some(pid) != old_pid {
+            new_pid = Some(pid);
+            break;
+        }
+    }
+    let new_pid = new_pid.expect("instance did not come back with a new pid after restart");
+    println!("OK   restart (pid {} → {new_pid})", old_pid.unwrap_or(0));
 
     // 5. A wrong session token must be dropped without an ack.
     let resp = call(addr, Action::OpenTerminal {

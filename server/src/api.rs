@@ -299,6 +299,7 @@ impl Api {
             Action::UpdateRepo { id } => respond(self.manager.update_repo(id).await.map(|_| Response::Done)),
             Action::UploadSource { id } => respond(self.upload_source(id).await),
             Action::RunInstance { id } => respond(self.manager.run(id).await.map(|_| Response::Done)),
+            Action::RestartInstance { id } => respond(self.manager.restart(id).await.map(|_| Response::Done)),
             Action::StopInstance { id } => respond(self.manager.stop(id).await.map(|_| Response::Done)),
             Action::KillInstance { id } => respond(self.manager.kill(id).await.map(|_| Response::Done)),
             Action::RemoveInstance { id, delete_files } => {

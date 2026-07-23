@@ -286,7 +286,7 @@ async fn main() {
     terminal.draw(|f| client::ui::draw(f, &app)).unwrap();
     dump("console", &terminal);
     assert_shows(&terminal, "instance-started", "console shows instance output");
-    assert_shows(&terminal, "── started ──", "console shows the start marker");
+    assert_shows(&terminal, "── started `", "console shows the start marker");
 
     // Scrolling back must stop following, and End must resume.
     app.on_key(key(KeyCode::PageUp));

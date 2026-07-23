@@ -682,8 +682,8 @@ const LANDING_KEYS: &[(&str, &str)] = &[
 ];
 
 const MANAGE_KEYS: &[(&str, &str)] = &[
-    ("↑↓", "instance"), ("pgup/pgdn", "console"), ("r", "start"), ("x", "stop"),
-    ("k", "kill"), ("u", "update repo"), ("s", "shell"), ("a", "attach"),
+    ("↑↓", "instance"), ("pgup/pgdn", "console"), ("r", "start"), ("R", "restart"),
+    ("x", "stop"), ("k", "kill"), ("u", "update repo"), ("s", "shell"), ("a", "attach"),
     ("b", "files"), ("e", "edit"), ("D", "remove"), ("?", "help"), ("esc", "back"),
 ];
 
@@ -840,6 +840,7 @@ fn draw_help(frame: &mut Frame, app: &App) {
             ("pgup / pgdn", "scroll the console"),
             ("home / end", "oldest line / back to following"),
             ("r", "start"),
+            ("R", "restart — on the self instance, the whole server"),
             ("x", "stop, with a grace period"),
             ("k", "kill, no grace period"),
             ("u", "re-clone the repo — the instance must be stopped"),

@@ -173,6 +173,8 @@ pub enum Pending {
     RemoveInstance { server: u128, instance: u128 },
     Transfer(TransferPlan),
     Bootstrap(u128),
+    /// Restart the self-managed instance, i.e. the server itself.
+    RestartServer { server: u128, instance: u128 },
 }
 
 #[derive(Clone, Copy)]
@@ -656,6 +658,7 @@ impl App {
             KeyCode::Home => self.scroll_console(isize::MAX),
 
             KeyCode::Char('r') => self.spawn_action("start", server, Action::RunInstance { id: instance }),
+            KeyCode::Char('R') => self.request_restart(),
             KeyCode::Char('x') => self.spawn_action("stop", server, Action::StopInstance { id: instance }),
             KeyCode::Char('u') => self.spawn_action("update repo", server, Action::UpdateRepo { id: instance }),
             KeyCode::Char('k') => self.confirm_kill(server, instance),
@@ -681,6 +684,28 @@ impl App {
             self.instance_name(server, instance),
         );
         self.pending_session = Some(SessionRequest { kind, endpoint, instance, label });
+    }
+
+    /// `R`: restart. On the self instance that means the whole server, so it
+    /// gets a confirm; a normal instance just stops and starts.
+    fn request_restart(&mut self) {
+        let Some(m) = self.manage() else { return };
+        let (server, instance) = (m.server, m.instance);
+        let is_self = self.instances_of(server).iter().any(|i| i.id == instance && i.self_managed);
+        if !is_self {
+            self.spawn_action("restart", server, Action::RestartInstance { id: instance });
+            return;
+        }
+        let name = self.entry(server).map(|e| e.name.clone()).unwrap_or_default();
+        self.modal = Some(Modal::Confirm {
+            title: "Restart server".to_string(),
+            message: format!(
+                "Restart '{name}' itself?\n\
+                 It hands over to a fresh process; connections drop for a moment.",
+            ),
+            toggle: None,
+            pending: Pending::RestartServer { server, instance },
+        });
     }
 
     fn open_browse_for_manage(&mut self) {
@@ -1065,6 +1090,9 @@ impl App {
             Pending::Transfer(plan) => self.start_transfer(plan, checked),
             Pending::Bootstrap(server) => {
                 self.spawn_action("bootstrap", server, Action::Bootstrap);
+            }
+            Pending::RestartServer { server, instance } => {
+                self.spawn_action("restart server", server, Action::RestartInstance { id: instance });
             }
         }
     }

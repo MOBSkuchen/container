@@ -82,6 +82,9 @@ pub enum Action {
     /// and marks the instance ready. The instance must be stopped.
     UploadSource { id: u128 },
     RunInstance { id: u128 },
+    /// Stop (if running) and start again. On the self-managed instance this
+    /// restarts the server itself: it hands over to a fresh process.
+    RestartInstance { id: u128 },
     /// Graceful stop (terminate → grace → kill on Unix; job terminate on Windows).
     StopInstance { id: u128 },
     /// Hard kill, no grace period.
