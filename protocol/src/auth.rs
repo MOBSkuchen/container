@@ -1,7 +1,7 @@
 //! Pre-shared-key authentication for the RPC channel.
 //!
 //! Both ends hold the same 1024-byte key, produced by `keygen` on either side:
-//! from a passphrase (SHAKE256, so the same phrase gives the same key on both
+//! from a passphrase (Argon2id, so the same phrase gives the same key on both
 //! machines) or from OS entropy (so it must then be copied across).
 //!
 //! Every request carries an HMAC-SHA256 over `nonce || timestamp || payload`,
@@ -23,9 +23,23 @@ use bier_derive::{Deserialize, Serialize};
 use bierpc::serialize::{Deserialize, Serialize};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use sha3::Shake256;
 
 pub const KEY_LEN: usize = 1024;
+
+/// Passphrase KDF cost. These, the version, and the salt are a wire contract:
+/// both ends must derive byte-identical keys from the same phrase, so they are
+/// pinned here rather than taken from a library default that a `cargo update`
+/// could shift out from under an existing pairing. Changing any of them
+/// re-pairs every phrase-derived key (a random key is untouched).
+const ARGON2_M_COST_KIB: u32 = 65536; // 64 MiB per derivation
+const ARGON2_T_COST: u32 = 3;
+const ARGON2_P_COST: u32 = 1;
+
+/// Domain-separation salt. A key derived deterministically on two machines has
+/// nowhere to keep a random per-derivation salt, so the salt is fixed and
+/// Argon2id's memory-hardness — not salt uniqueness — is what makes an offline
+/// phrase guess expensive.
+const KDF_SALT: &[u8] = b"container-auth-kdf-v1";
 
 /// How far apart the two clocks may be before a request is refused. Also the
 /// window a nonce must be remembered for.
@@ -34,21 +48,19 @@ pub const MAX_SKEW: Duration = Duration::from_secs(60);
 const NONCE_LEN: usize = 16;
 
 /// Derive a key from `input`, or draw a fresh random one when it is absent or
-/// empty. SHAKE256 is an extendable-output function, so the full 1024 bytes
-/// come straight from the sponge.
+/// empty. Argon2id emits the full 1024 bytes directly, so a weak phrase costs
+/// a guesser 64 MiB and real time per attempt (see the KDF constants above).
 pub fn hash_or_random(input: Option<&str>) -> [u8; KEY_LEN] {
-    // Scoped: `digest::Update::update` would otherwise collide with
-    // `hmac::Mac::update` on the HMAC calls below.
-    use sha3::digest::{ExtendableOutput, Update, XofReader};
-
     let mut output = [0u8; KEY_LEN];
 
     match input {
         Some(text) if !text.is_empty() => {
-            let mut hasher = Shake256::default();
-            hasher.update(text.as_bytes());
-            let mut reader = hasher.finalize_xof();
-            reader.read(&mut output);
+            // `output_len: None` so the 1024-byte buffer sets the tag length.
+            let params = argon2::Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, None)
+                .expect("pinned Argon2 parameters are in range");
+            argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+                .hash_password_into(text.as_bytes(), KDF_SALT, &mut output)
+                .expect("Argon2id cannot fail with valid fixed parameters");
         }
         _ => {
             getrandom::fill(&mut output).expect("the OS refused to provide entropy");
@@ -259,4 +271,43 @@ pub async fn encode<T: Serialize + Sync>(value: &T) -> std::io::Result<Vec<u8>> 
 
 pub async fn decode<T: Deserialize>(bytes: &[u8]) -> std::io::Result<T> {
     T::deserialize(bytes).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The KDF is a wire contract: `cargo test` must catch a param/version/salt
+    // change that would silently re-key every phrase-derived pairing, without
+    // needing a live smoke run to notice.
+
+    #[test]
+    fn phrase_derivation_is_deterministic_and_full_length() {
+        let a = hash_or_random(Some("correct horse battery staple"));
+        let b = hash_or_random(Some("correct horse battery staple"));
+        assert_eq!(a, b, "same phrase must derive the same key on both sides");
+        assert_eq!(a.len(), KEY_LEN);
+    }
+
+    #[test]
+    fn different_phrases_diverge() {
+        let a = hash_or_random(Some("phrase-one"));
+        let b = hash_or_random(Some("phrase-two"));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn empty_or_absent_input_is_random() {
+        // No phrase → OS entropy, so two draws must differ.
+        assert_ne!(hash_or_random(None), hash_or_random(None));
+        assert_ne!(hash_or_random(Some("")), hash_or_random(Some("")));
+    }
+
+    #[test]
+    fn known_answer_pins_the_parameters() {
+        // A frozen prefix of Argon2id(V0x13, m=64MiB, t=3, p=1, salt=KDF_SALT)
+        // over "container-kat". Any drift in the pinned constants breaks this.
+        let key = hash_or_random(Some("container-kat"));
+        assert_eq!(&to_hex(&key[..16]), "91ded328b4d9003f54c750bd895040af");
+    }
 }

@@ -34,7 +34,10 @@ const INSTANCE: &str = "tui-smoke";
 const PHRASE: &str = "smoke-test-passphrase";
 
 fn key_bytes() -> Vec<u8> {
-    auth::hash_or_random(Some(PHRASE)).to_vec()
+    // Memoized: the Argon2id derivation is deliberately expensive.
+    use std::sync::OnceLock;
+    static KEY: OnceLock<Vec<u8>> = OnceLock::new();
+    KEY.get_or_init(|| auth::hash_or_random(Some(PHRASE)).to_vec()).clone()
 }
 
 fn endpoint(addr: SocketAddr) -> Endpoint {
