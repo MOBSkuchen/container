@@ -117,6 +117,17 @@ pub fn decode(buf: &[u8]) -> Decoded<'_> {
     Decoded::Frame(frame, end)
 }
 
+/// Bytes still needed to complete the frame `pending` has started — the header
+/// first, then its declared payload. At least 1 whenever `decode` is
+/// `Incomplete`. Used to bound each read to the frame boundary.
+fn frame_shortfall(pending: &[u8]) -> usize {
+    if pending.len() < HEADER_LEN {
+        return HEADER_LEN - pending.len();
+    }
+    let len = u32::from_be_bytes([pending[1], pending[2], pending[3], pending[4]]) as usize;
+    (HEADER_LEN + len).saturating_sub(pending.len()).max(1)
+}
+
 /// Reads whole frames off an async stream, buffering partial ones. Used as a
 /// `select!` branch, so it yields one frame per call rather than looping.
 pub struct FrameReader {
@@ -136,6 +147,10 @@ impl FrameReader {
 
     /// The next whole frame, `None` at a clean end of stream. A length past
     /// `MAX_FRAME`, or an EOF mid-frame, is an error.
+    ///
+    /// Never reads past the current frame's last byte: after a `Close`, the
+    /// buffer is empty, so whatever follows on the stream — e.g. the persistent
+    /// call's reply — is left untouched for the next reader.
     pub async fn next<R: AsyncRead + Unpin>(&mut self, r: &mut R) -> io::Result<Option<OwnedFrame>> {
         let mut buf = [0u8; 8192];
         loop {
@@ -149,7 +164,10 @@ impl FrameReader {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "session frame length out of range"));
                 }
                 Decoded::Incomplete => {
-                    let n = r.read(&mut buf).await?;
+                    // Only what this frame still needs — reading further would
+                    // swallow the bytes that come after it.
+                    let want = frame_shortfall(&self.pending).min(buf.len());
+                    let n = r.read(&mut buf[..want]).await?;
                     if n == 0 {
                         return if self.pending.is_empty() {
                             Ok(None)
@@ -237,6 +255,22 @@ mod tests {
         assert_eq!(reader.next(&mut cursor).await.unwrap(), Some(OwnedFrame::Resize { cols: 80, rows: 24 }));
         assert_eq!(reader.next(&mut cursor).await.unwrap(), Some(OwnedFrame::Close));
         assert_eq!(reader.next(&mut cursor).await.unwrap(), None);
+    }
+
+    // The bytes that follow a frame (e.g. the persistent call's reply after a
+    // Close) must not be swallowed, even when they arrive in the same read.
+    #[tokio::test]
+    async fn frame_reader_stops_at_the_boundary() {
+        use tokio::io::AsyncReadExt;
+        let mut stream = close_frame().to_vec();
+        stream.extend_from_slice(b"REPLY-BYTES");
+        let mut cursor = std::io::Cursor::new(stream);
+        let mut reader = FrameReader::new();
+        assert_eq!(reader.next(&mut cursor).await.unwrap(), Some(OwnedFrame::Close));
+        // Everything after the Close frame is still on the stream, untouched.
+        let mut rest = Vec::new();
+        cursor.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, b"REPLY-BYTES");
     }
 
     #[test]
