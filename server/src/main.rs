@@ -1,11 +1,11 @@
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::str::FromStr;
-use bierpc::RpcServer;
+use bierpc::rpc::{RpcServer, ServerConfig};
 use clap::Parser;
 use console::Term;
 use protocol::auth;
-use server::api::{Api, Reply, Request};
+use server::api::Api;
 use server::cli::{self, gather_value_routine, Commands};
 use server::manager::InstanceManager;
 use server::storage::{default_shell, ServerStg};
@@ -13,7 +13,9 @@ use server::storage::{default_shell, ServerStg};
 async fn _init(config_file: PathBuf) -> anyhow::Result<()> {
     let term = Term::stdout();
 
-    let addr: SocketAddrV4 = gather_value_routine(&term, "Server address: ", Some(SocketAddrV4::from_str("0.0.0.0:5000").unwrap()))?;
+    // Loopback by default: the channel authenticates but does not encrypt, so
+    // wider exposure should be a deliberate choice (see the prompt text).
+    let addr: SocketAddrV4 = gather_value_routine(&term, "Server address (0.0.0.0 exposes every interface — trusted networks only): ", Some(SocketAddrV4::from_str("127.0.0.1:5000").unwrap()))?;
     let storage_path: PathBuf = gather_value_routine(&term, "Storage path: ", Some(PathBuf::from_str("ctchld").unwrap()))?;
     let config_path: PathBuf = gather_value_routine(&term, "Config file: ", Some(config_file))?;
     let file_roots: String = gather_value_routine(&term, "File roots (';'-separated, empty for none): ", Some(String::new()))?;
@@ -96,10 +98,16 @@ async fn _keygen(config_path: PathBuf, phrase: Option<String>, key: Option<Strin
     Ok(())
 }
 
-async fn _start(config_path: PathBuf) -> anyhow::Result<()> {
+async fn _start(config_path: PathBuf, bootstrap: bool) -> anyhow::Result<()> {
     use anyhow::Context;
-    let (stg, instances) = ServerStg::load(&config_path).await
+    let (mut stg, instances) = ServerStg::load(&config_path).await
         .with_context(|| format!("loading config '{}' (run `init` first?)", config_path.display()))?;
+
+    // The flag only grants for this run what the config withholds; it is
+    // never persisted.
+    if bootstrap {
+        stg.bootstrap = true;
+    }
 
     // Spawned by a bootstrapping predecessor: it is still draining, so wait
     // for it to release the address before claiming it.
@@ -116,16 +124,27 @@ async fn _start(config_path: PathBuf) -> anyhow::Result<()> {
     let handler = Api::new(stg.clone(), manager.clone());
 
     println!("Starting server on {}", stg.addr);
-    let server = RpcServer::<Request, Reply, _>::new(stg.addr, handler)
+    if !stg.addr.ip().is_loopback() {
+        println!("note: requests are authenticated but NOT encrypted — expose this \
+                  address only on a trusted network or through a tunnel (SSH/WireGuard).");
+    }
+    let server = RpcServer::new(stg.addr, handler)
         .await
-        .map_err(|e| anyhow::anyhow!("failed to bind {}: {:?}", stg.addr, e))?;
+        .map_err(|e| anyhow::anyhow!("failed to bind {}: {:?}", stg.addr, e))?
+        // Bounded so stalled peers hold a slot only until the idle/request
+        // timeouts reclaim it, instead of wedging the server.
+        .with_config(ServerConfig {
+            max_connections: 64,
+            request_timeout: Some(std::time::Duration::from_secs(30)),
+            ..Default::default()
+        });
 
     // After the bind: during a takeover the predecessor may still be
     // stopping the very instances autostart would launch.
     manager.autostart().await;
 
     tokio::select! {
-        _ = server.run(4) => {}
+        _ = server.run() => {}
         _ = tokio::signal::ctrl_c() => {
             println!("Shutting down, stopping instances...");
             manager.shutdown_all().await;
@@ -142,7 +161,7 @@ async fn _main() -> anyhow::Result<()> {
 
     if let Some(cmd) = cli.command {
         match cmd {
-            Commands::Start { .. } => _start(config_file).await?,
+            Commands::Start { bootstrap } => _start(config_file, bootstrap).await?,
             Commands::Init => _init(config_file).await?,
             Commands::Keygen { phrase, key } => _keygen(config_file, phrase, key).await?,
             Commands::PurgeInstances => _purge_instances(&config_file).await?,

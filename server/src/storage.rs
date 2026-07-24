@@ -73,17 +73,28 @@ impl ServerStg {
         };
         fs::create_dir_all(ft.instances_dir()).await?;
         ft.save().await?;
-        let instances = ft.load_instances().await.map_err(|e| {anyhow::Error::msg("failed to read instance file. It might be out of date. Use `server purge-instances` to remove it.")})?;
+        let instances = ft.load_instances().await.map_err(|e| anyhow::anyhow!(
+            "failed to read the instance file ({e}). It might be out of date. \
+             Use `server purge-instances` to remove it."))?;
         Ok((ft, instances))
     }
 
+    /// Atomic (temp-then-rename): a truncated config is unrecoverable short
+    /// of re-running `init`, so it must never be written in place.
     pub async fn save(&self) -> anyhow::Result<()> {
-        let mut f = fs::File::options()
-            .create(true).truncate(true).write(true)
-            .open(&self.config_path).await?;
-        self.serialize(&mut f).await?;
-        use tokio::io::AsyncWriteExt;
-        f.flush().await?;
+        let tmp = self.config_path.with_extension("chld.tmp");
+        {
+            let mut f = fs::File::options()
+                .create(true).truncate(true).write(true)
+                .open(&tmp).await?;
+            self.serialize(&mut f).await?;
+            use tokio::io::AsyncWriteExt;
+            f.flush().await?;
+        }
+        if self.config_path.exists() {
+            fs::remove_file(&self.config_path).await?;
+        }
+        fs::rename(&tmp, &self.config_path).await?;
         Ok(())
     }
 

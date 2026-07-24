@@ -494,8 +494,15 @@ impl App {
                             // lines that arrived below, so reading does not
                             // get yanked around by a chatty instance.
                             if !m.following() {
-                                let grew = lines.len().saturating_sub(m.console.len());
-                                m.console_scroll = (m.console_scroll + grew).min(lines.len());
+                                // `dropped + len` is the absolute stream
+                                // position; raw lengths stop growing once the
+                                // ring buffer is full and would let the view
+                                // drift.
+                                let grew = (dropped + lines.len() as u64)
+                                    .saturating_sub(m.console_dropped + m.console.len() as u64);
+                                m.console_scroll = m.console_scroll
+                                    .saturating_add(grew as usize)
+                                    .min(lines.len());
                             }
                             m.console = lines;
                             m.console_dropped = dropped;

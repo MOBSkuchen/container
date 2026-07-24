@@ -37,6 +37,8 @@ enum Command {
         #[arg(help = "<server>/<instance> or just <server> if the name is unambiguous")]
         target: String,
     },
+    #[command(about = "List every server and its instances", long_about = "List every server and its instances, one line each — the scriptable view of what the TUI shows.")]
+    Ls,
     #[command(about = "Set the auth key with the server", long_about = "Derive, create and set the key for auth with a remote server.")]
     Keygen {
         #[arg(help = "Phrase to derive key from.")]
@@ -86,11 +88,69 @@ async fn run() -> anyhow::Result<()> {
             };
             tui(book, config_path, Some(start)).await
         }
+        Some(Command::Ls) => ls(book).await,
         Some(Command::Keygen { phrase, key, server }) => {
             keygen(book, config_path, phrase, key, server).await
         }
         None => tui(book, config_path, None).await,
     }
+}
+
+/// One line per server and instance. Unreachable servers become a line, not
+/// an error: a fleet with one dead box must still list the rest.
+async fn ls(book: Book) -> anyhow::Result<()> {
+    use protocol::{InstanceStatResponse, RepoState, RunState};
+
+    if book.servers.is_empty() {
+        println!("no servers configured — add one in the TUI (run `client` with no arguments)");
+        return Ok(());
+    }
+
+    fn status(inst: &InstanceStatResponse) -> String {
+        let first_line = |s: &str| s.lines().next().unwrap_or_default().to_string();
+        if inst.self_managed {
+            return "this server".to_string();
+        }
+        match &inst.repo {
+            RepoState::Provisioning => return "preparing".to_string(),
+            RepoState::CloneFailed(e) => return format!("source failed: {}", first_line(e)),
+            RepoState::Ready => {}
+        }
+        match &inst.run {
+            RunState::NotRunning | RunState::Stopped => "stopped".to_string(),
+            RunState::Starting => "starting".to_string(),
+            RunState::Running { pids, restarts } => {
+                let pid = pids.first().map(|p| format!("pid {p}")).unwrap_or_else(|| "no pids".to_string());
+                if *restarts > 0 { format!("running ({pid}, {restarts} restarts)") } else { format!("running ({pid})") }
+            }
+            RunState::Backoff { delay_ms, restarts } =>
+                format!("restarting in {:.1}s ({restarts} restarts)", *delay_ms as f64 / 1000.0),
+            RunState::Exited { code, signal, .. } => match (code, signal) {
+                (Some(c), _) => format!("exited ({c})"),
+                (None, Some(s)) => format!("killed by signal {s}"),
+                (None, None) => "exited".to_string(),
+            },
+            RunState::Failed(e) => format!("failed: {}", first_line(e)),
+        }
+    }
+
+    for server in &book.servers {
+        let endpoint = book.endpoint_or_keyless(server);
+        match net::stat(&endpoint).await {
+            Ok(vitals) => {
+                println!("{} ({})", server.name, server.addr);
+                if vitals.instances.is_empty() {
+                    println!("  (no instances)");
+                }
+                for inst in &vitals.instances {
+                    // The id is what `attach`/`shell` accept unambiguously.
+                    println!("  {:<24} {:032x}  {}", inst.name, inst.id, status(inst));
+                }
+            }
+            Err(e) => println!("{} ({}) — {}", server.name, server.addr, e.short()),
+        }
+    }
+    Ok(())
 }
 
 /// Opening screen for `client browse`.

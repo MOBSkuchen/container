@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
-use bierpc::RpcClient;
+use bierpc::rpc::RpcClient;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use protocol::{auth, term};
@@ -33,8 +33,9 @@ async fn call(addr: SocketAddr, action: Action) -> Response {
     call_with(addr, &key(), action).await.expect("rpc call failed")
 }
 
-/// One authenticated round trip. The server handles a single action per
-/// connection, so this dials fresh each time.
+/// One authenticated round trip. Dials fresh each time: connections are
+/// reusable now, but a fresh dial keeps every call independent of the last
+/// test's failure mode.
 async fn call_with(addr: SocketAddr, key: &[u8], action: Action) -> Result<Response, AuthFailure> {
     let payload = auth::encode(&action).await.expect("encode failed");
     let request = auth::sign_request(key, payload);

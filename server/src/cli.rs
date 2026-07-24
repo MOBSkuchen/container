@@ -17,7 +17,9 @@ pub struct Cli {
 pub enum Commands {
     #[command(long_about = "Starts up")]
     Start {
-        #[arg(short = 'b', long = "bootstrap", long_help = "Starts as a daemon")]
+        #[arg(short = 'b', long = "bootstrap",
+              long_help = "Allow the Bootstrap handover for this run even if the config \
+                           disables it. Not persisted.")]
         bootstrap: bool
     },
     #[command(long_about = "Initializes a new instance")]

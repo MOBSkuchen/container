@@ -2,9 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use bierpc::error::RpcResult;
-use bierpc::RpcServerHandler;
+use bierpc::rpc::RpcServerHandler;
+use std::sync::Mutex;
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, Networks, RefreshKind, System};
-use tokio::sync::Mutex;
 use protocol::auth;
 use crate::manager::{InstanceManager, InstancePatch};
 use crate::storage::{ServerStg, InstanceConfig};
@@ -27,9 +27,10 @@ pub struct Api {
     /// The sampling state below is kept across calls on purpose: sysinfo
     /// reports CPU usage as the delta between two refreshes, so a `System`
     /// built per request can only ever return a meaningless first sample.
-    sys: Mutex<System>,
-    networks: Mutex<Networks>,
-    disks: Mutex<Disks>,
+    /// Arc'd so the blocking refresh task can own a handle.
+    sys: Arc<Mutex<System>>,
+    networks: Arc<Mutex<Networks>>,
+    disks: Arc<Mutex<Disks>>,
     replay: auth::ReplayGuard,
 }
 
@@ -45,9 +46,9 @@ impl Api {
         Self {
             stg,
             manager,
-            sys: Mutex::new(sys),
-            networks: Mutex::new(Networks::new_with_refreshed_list()),
-            disks: Mutex::new(Disks::new_with_refreshed_list()),
+            sys: Arc::new(Mutex::new(sys)),
+            networks: Arc::new(Mutex::new(Networks::new_with_refreshed_list())),
+            disks: Arc::new(Mutex::new(Disks::new_with_refreshed_list())),
             replay: auth::ReplayGuard::new(),
         }
     }
@@ -64,32 +65,36 @@ impl Api {
         let instances = self.manager.list().await;
         let bootstrap = self.stg.bootstrap && self.manager.bootstrap_available().await;
 
-        let (cpu_usage, total_ram, free_ram) = {
-            let mut sys = self.sys.lock().await;
-            sys.refresh_cpu_usage();
-            sys.refresh_memory();
-            // `available_memory` is what a caller can actually still use;
-            // on Windows it is identical to `free_memory` anyway.
-            (sys.global_cpu_usage() as f64, sys.total_memory(), sys.available_memory())
-        };
+        // sysinfo refreshes are blocking syscalls (disk enumeration can be
+        // slow), so they run off the async runtime.
+        let (sys, disks, networks) = (self.sys.clone(), self.disks.clone(), self.networks.clone());
+        let ((cpu_usage, total_ram, free_ram), (total_stg, free_stg), (network_recv, network_trans)) =
+            tokio::task::spawn_blocking(move || {
+                let mut sys = sys.lock().unwrap_or_else(|e| e.into_inner());
+                sys.refresh_cpu_usage();
+                sys.refresh_memory();
+                // `available_memory` is what a caller can actually still use;
+                // on Windows it is identical to `free_memory` anyway.
+                let cpu_ram = (sys.global_cpu_usage() as f64, sys.total_memory(), sys.available_memory());
 
-        let (total_stg, free_stg) = {
-            let mut disks = self.disks.lock().await;
-            disks.refresh(true);
-            disks.iter().fold((0, 0), |(total, free), disk| {
-                (total + disk.total_space(), free + disk.available_space())
-            })
-        };
+                let mut disks = disks.lock().unwrap_or_else(|e| e.into_inner());
+                disks.refresh(true);
+                let stg = disks.iter().fold((0, 0), |(total, free), disk| {
+                    (total + disk.total_space(), free + disk.available_space())
+                });
 
-        // Cumulative counters, not per-refresh deltas: the client turns them
-        // into rates itself, and `received()` would reset on every refresh.
-        let (network_recv, network_trans) = {
-            let mut networks = self.networks.lock().await;
-            networks.refresh(true);
-            networks.iter().fold((0, 0), |(recv, trans), (_, data)| {
-                (recv + data.total_received(), trans + data.total_transmitted())
-            })
-        };
+                // Cumulative counters, not per-refresh deltas: the client turns
+                // them into rates itself, and `received()` would reset on every
+                // refresh.
+                let mut networks = networks.lock().unwrap_or_else(|e| e.into_inner());
+                networks.refresh(true);
+                let net = networks.iter().fold((0, 0), |(recv, trans), (_, data)| {
+                    (recv + data.total_received(), trans + data.total_transmitted())
+                });
+
+                (cpu_ram, stg, net)
+            }).await
+            .map_err(|e| bierpc::error::RpcError::from(std::io::Error::other(format!("stat sampling panicked: {e}"))))?;
 
         Ok(Response::StatResponse {
             total_stg,
@@ -253,7 +258,10 @@ impl Api {
 /// A refusal is deliberately vague on the wire (`AuthFailure`) and detailed in
 /// the log: the operator needs to know *why*, a caller holding the wrong key
 /// does not.
-impl RpcServerHandler<Request, Reply> for Api {
+impl RpcServerHandler for Api {
+    type Action = Request;
+    type Response = Reply;
+
     async fn handle(&self, request: Request) -> RpcResult<Reply> {
         let payload = match auth::verify_request(&self.stg.key, &request, &self.replay) {
             Ok(payload) => payload,

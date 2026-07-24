@@ -5,7 +5,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use anyhow::Context;
-use bierpc::RpcClient;
+use bierpc::error::RpcError;
+use bierpc::rpc::{ClientConfig, RpcClient};
 use protocol::auth;
 use protocol::{
     Action, ApiError, AuthFailure, ConsoleLine, DirEntry, InstanceStatResponse, InstanceStatus,
@@ -15,6 +16,26 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn client_config() -> ClientConfig {
+    ClientConfig {
+        connect_timeout: RPC_TIMEOUT,
+        call_timeout: Some(RPC_TIMEOUT),
+        // Console tails and large directory listings outgrow the 1 MiB default.
+        max_message_bytes: 8 * 1024 * 1024,
+        ..Default::default()
+    }
+}
+
+/// `RpcError` has no Display; pick out the part worth showing.
+fn rpc_detail(e: &RpcError) -> String {
+    match e {
+        RpcError::IoError { err } => err.to_string(),
+        RpcError::TimedOut { phase, after } => format!("{phase} timed out after {}s", after.as_secs()),
+        RpcError::CallTypeRejected { reason } => reason.clone(),
+        RpcError::ConnectionPoisoned => "connection is poisoned".to_string(),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum NetError {
@@ -70,18 +91,13 @@ pub async fn call_with_key(addr: SocketAddr, key: &[u8], action: Action) -> Resu
     let request = auth::sign_request(key, payload);
     let nonce = request.nonce.clone();
 
-    let connect = tokio::time::timeout(RPC_TIMEOUT, RpcClient::<Request>::new(addr));
-    let mut client = match connect.await {
-        Err(_) => return Err(NetError::Unreachable(format!("{addr} did not accept a connection within {}s", RPC_TIMEOUT.as_secs()))),
-        Ok(Err(_)) => return Err(NetError::Unreachable(format!("cannot connect to {addr} — is the server running?"))),
-        Ok(Ok(c)) => c,
-    };
+    let mut client = RpcClient::<Request>::new_with_config(addr, client_config()).await
+        .map_err(|e| NetError::Unreachable(format!(
+            "cannot connect to {addr} ({}) — is the server running?", rpc_detail(&e))))?;
 
-    let reply = match tokio::time::timeout(RPC_TIMEOUT, client.call::<Reply>(request)).await {
-        Err(_) => return Err(NetError::Protocol(format!("{addr} accepted the connection but did not answer within {}s", RPC_TIMEOUT.as_secs()))),
-        Ok(Err(_)) => return Err(NetError::Protocol(format!("{addr} closed the connection mid-request"))),
-        Ok(Ok(reply)) => reply,
-    };
+    let reply = client.call::<Reply>(request).await
+        .map_err(|e| NetError::Protocol(format!(
+            "{addr} accepted the connection but the request failed: {}", rpc_detail(&e))))?;
 
     let payload = auth::verify_reply(key, &nonce, &reply).map_err(NetError::Auth)?;
     match auth::decode::<Response>(payload).await {

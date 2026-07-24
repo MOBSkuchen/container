@@ -173,7 +173,7 @@ fn ping_test() {
     });
 
     // How much output arrives in a window, answering DSR queries as we go.
-    let mut drain = |wait: Duration, writer: &mut Box<dyn Write + Send>| -> usize {
+    let drain = |wait: Duration, writer: &mut Box<dyn Write + Send>| -> usize {
         let deadline = Instant::now() + wait;
         let mut total = 0;
         while let Ok(chunk) =

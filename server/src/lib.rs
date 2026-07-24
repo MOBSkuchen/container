@@ -7,3 +7,4 @@ pub mod session;
 pub mod sourceops;
 pub mod terminal;
 pub mod transfer;
+pub mod unpack;

@@ -185,9 +185,9 @@ pub async fn receive_archive(mut stream: TcpStream, dest: PathBuf) -> std::io::R
 
 fn unpack_blocking(archive: &Path, dest: &Path) -> std::io::Result<()> {
     let file = std::fs::File::open(archive)?;
-    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
-    // The tar crate refuses entries that would escape `dest` on its own.
-    tar.unpack(dest)
+    // Entry-wise, not `unpack`: link entries pointing outside `dest` must be
+    // refused, not just `..` traversal.
+    crate::unpack::untar(tar::Archive::new(flate2::read::GzDecoder::new(file)), dest)
 }
 
 /// Session handler: pack `paths` into a tar.gz, then stream it

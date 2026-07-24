@@ -113,16 +113,18 @@ async fn fetch_url(url: &str, dest: &Path) -> Result<(), String> {
     result
 }
 
+// Via `crate::unpack`: a downloaded archive is untrusted input, and link
+// entries pointing outside the repo dir must be refused.
 fn unpack(archive: &Path, kind: ArchiveKind, dest: &Path) -> Result<(), String> {
     let file = std::fs::File::open(archive).map_err(|e| format!("reopening the download: {e}"))?;
     match kind {
-        ArchiveKind::TarGz => tar::Archive::new(flate2::read::GzDecoder::new(file)).unpack(dest)
+        ArchiveKind::TarGz => crate::unpack::untar(tar::Archive::new(flate2::read::GzDecoder::new(file)), dest)
             .map_err(|e| format!("unpacking tar.gz: {e}")),
-        ArchiveKind::Tar => tar::Archive::new(file).unpack(dest)
+        ArchiveKind::Tar => crate::unpack::untar(tar::Archive::new(file), dest)
             .map_err(|e| format!("unpacking tar: {e}")),
         ArchiveKind::Zip => zip::ZipArchive::new(file)
-            .and_then(|mut zip| zip.extract(dest))
-            .map_err(|e| format!("unpacking zip: {e}")),
+            .map_err(|e| format!("unpacking zip: {e}"))
+            .and_then(|zip| crate::unpack::unzip(zip, dest).map_err(|e| format!("unpacking zip: {e}"))),
         ArchiveKind::Plain => unreachable!("plain files are copied, not unpacked"),
     }
 }
