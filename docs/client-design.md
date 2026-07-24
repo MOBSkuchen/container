@@ -620,13 +620,19 @@ enum Reply { Signed { timestamp_ms, mac, payload }, Rejected(AuthFailure) }
   is inherently unsigned, so the client treats it as a hint for the operator,
   never as a basis for a security decision.
 
-### What this does and does not do
+### Transport encryption
 
-It authenticates; it does **not** encrypt. Anyone on the path can still read
-instance names, repo URLs and console output. What it stops is unauthorized
-*control* of a server, which is the point. Session side-channels (terminals,
-file transfer) are unaffected: their 32-byte tokens are minted server-side and
-delivered over this now-authenticated channel.
+The RPC channel runs over **TLS 1.3**, and the trust is anchored in the same
+shared key (`protocol::tls`): the server's Ed25519 TLS identity is derived from
+the key via HKDF, and the client pins the derived public key. A peer without
+the key cannot complete the handshake, so an on-path attacker can neither read
+the traffic nor impersonate the server — no certificate files, no CA, no
+first-use trust leap. The HMAC layer above still authenticates the *client* and
+guards replay; TLS authenticates the *server* and encrypts.
+
+Session side-channels (terminals, file transfer) still run on their own
+ephemeral ports guarded by a 32-byte token minted over this channel; folding
+them onto the encrypted connection is the next step.
 
 Rotating a key (`server keygen`) locks out every client still holding the old
 one, by design.

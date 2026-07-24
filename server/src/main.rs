@@ -123,11 +123,12 @@ async fn _start(config_path: PathBuf, bootstrap: bool) -> anyhow::Result<()> {
     let manager = InstanceManager::new(stg.clone(), instances);
     let handler = Api::new(stg.clone(), manager.clone());
 
+    // TLS identity derived from the shared key: the client pins it, so a peer
+    // without the key cannot even complete the handshake.
+    let tls = protocol::tls::Identity::derive(&stg.key).server_config()
+        .map_err(|e| anyhow::anyhow!("building the TLS identity: {e}"))?;
+
     println!("Starting server on {}", stg.addr);
-    if !stg.addr.ip().is_loopback() {
-        println!("note: requests are authenticated but NOT encrypted — expose this \
-                  address only on a trusted network or through a tunnel (SSH/WireGuard).");
-    }
     let server = RpcServer::new(stg.addr, handler)
         .await
         .map_err(|e| anyhow::anyhow!("failed to bind {}: {:?}", stg.addr, e))?
@@ -136,6 +137,7 @@ async fn _start(config_path: PathBuf, bootstrap: bool) -> anyhow::Result<()> {
         .with_config(ServerConfig {
             max_connections: 64,
             request_timeout: Some(std::time::Duration::from_secs(30)),
+            tls: Some(tls),
             ..Default::default()
         });
 

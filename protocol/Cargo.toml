@@ -14,3 +14,13 @@ getrandom = "0.4.3"
 # Only the raw-bytes KDF (`hash_password_into`), so the PHC-string / rng
 # features are off.
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc"] }
+# TLS identity derived from the shared key (see `tls`). rustls itself comes via
+# bierpc's re-export, so the provider version cannot drift from the transport.
+hkdf = "0.12.4"
+ed25519-dalek = "2.2.0"
+rcgen = "0.13.2"
+x509-parser = "0.16.0"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["full"] }
+tokio-rustls = "0.26.4"

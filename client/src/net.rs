@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::Context;
 use bierpc::error::RpcError;
 use bierpc::rpc::{ClientConfig, RpcClient};
-use protocol::auth;
+use protocol::{auth, tls};
 use protocol::{
     Action, ApiError, AuthFailure, ConsoleLine, DirEntry, InstanceStatResponse, InstanceStatus,
     Reply, Request, Response,
@@ -17,13 +17,37 @@ use tokio::net::TcpStream;
 
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn client_config() -> ClientConfig {
+fn client_config(key: &[u8]) -> ClientConfig {
     ClientConfig {
         connect_timeout: RPC_TIMEOUT,
         call_timeout: Some(RPC_TIMEOUT),
         // Console tails and large directory listings outgrow the 1 MiB default.
         max_message_bytes: 8 * 1024 * 1024,
+        // Pin the server identity derived from the same key. A server with a
+        // different key cannot complete the handshake.
+        tls: Some(tls::client_config(tls::Identity::derive(key).public_key())),
         ..Default::default()
+    }
+}
+
+/// Tell "nothing is listening" apart from "the handshake was rejected". A TLS
+/// pin mismatch is a key problem, not an unreachable host, and deserves the
+/// keygen hint rather than "is the server running?".
+fn connect_error(addr: SocketAddr, e: RpcError) -> NetError {
+    let refused = matches!(&e, RpcError::IoError { err } if matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::AddrNotAvailable
+    ));
+    if refused || matches!(e, RpcError::TimedOut { .. }) {
+        NetError::Unreachable(format!("cannot connect to {addr} ({}) — is the server running?", rpc_detail(&e)))
+    } else {
+        // A completed TCP connection that then failed the TLS handshake is a
+        // key mismatch (or a MITM without the key); same remedy as a rejected key.
+        NetError::Auth(AuthFailure::BadKey)
     }
 }
 
@@ -91,9 +115,8 @@ pub async fn call_with_key(addr: SocketAddr, key: &[u8], action: Action) -> Resu
     let request = auth::sign_request(key, payload);
     let nonce = request.nonce.clone();
 
-    let mut client = RpcClient::<Request>::new_with_config(addr, client_config()).await
-        .map_err(|e| NetError::Unreachable(format!(
-            "cannot connect to {addr} ({}) — is the server running?", rpc_detail(&e))))?;
+    let mut client = RpcClient::<Request>::new_with_config(addr, client_config(key)).await
+        .map_err(|e| connect_error(addr, e))?;
 
     let reply = client.call::<Reply>(request).await
         .map_err(|e| NetError::Protocol(format!(

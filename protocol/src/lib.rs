@@ -13,6 +13,7 @@ pub mod api;
 pub mod auth;
 pub mod instance;
 pub mod term;
+pub mod tls;
 
 pub use api::{Action, ApiError, DirEntry, ErrorCode, Response, TerminalMode};
 pub use auth::{AuthFailure, Reply, Request};

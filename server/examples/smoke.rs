@@ -14,10 +14,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
-use bierpc::rpc::RpcClient;
+use bierpc::rpc::{ClientConfig, RpcClient};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use protocol::{auth, term};
+use protocol::{auth, term, tls};
 use protocol::{AuthFailure, Reply, Request};
 use server::api::{Action, ErrorCode, Response, TerminalMode};
 use server::manager::{RepoState, RetryPolicy, RunState, Source};
@@ -33,6 +33,14 @@ fn key() -> Vec<u8> {
     KEY.get_or_init(|| auth::hash_or_random(Some(PHRASE)).to_vec()).clone()
 }
 
+/// A TLS client config pinning the server identity derived from `key`.
+fn tls_config(key: &[u8]) -> ClientConfig {
+    ClientConfig {
+        tls: Some(tls::client_config(tls::Identity::derive(key).public_key())),
+        ..Default::default()
+    }
+}
+
 async fn call(addr: SocketAddr, action: Action) -> Response {
     call_with(addr, &key(), action).await.expect("rpc call failed")
 }
@@ -45,7 +53,12 @@ async fn call_with(addr: SocketAddr, key: &[u8], action: Action) -> Result<Respo
     let request = auth::sign_request(key, payload);
     let nonce = request.nonce.clone();
 
-    let mut client = RpcClient::<Request>::new(addr).await.expect("connect failed");
+    // A wrong key now derives a wrong TLS pin, so it fails at the handshake
+    // rather than reaching the HMAC check — same BadKey outcome, earlier.
+    let mut client = match RpcClient::<Request>::new_with_config(addr, tls_config(key)).await {
+        Ok(c) => c,
+        Err(_) => return Err(AuthFailure::BadKey),
+    };
     let reply = client.call::<Reply>(request).await.expect("rpc call failed");
 
     let payload = auth::verify_reply(key, &nonce, &reply)?;
@@ -53,9 +66,10 @@ async fn call_with(addr: SocketAddr, key: &[u8], action: Action) -> Result<Respo
 }
 
 /// Send a request verbatim, bypassing the signing helpers, so replay and
-/// tampering can be exercised.
+/// tampering can be exercised. Uses the correct key's TLS pin so the tampered
+/// *request* is what the server judges, not the transport.
 async fn call_raw(addr: SocketAddr, request: Request) -> Reply {
-    let mut client = RpcClient::<Request>::new(addr).await.expect("connect failed");
+    let mut client = RpcClient::<Request>::new_with_config(addr, tls_config(&key())).await.expect("connect failed");
     client.call::<Reply>(request).await.expect("rpc call failed")
 }
 
@@ -259,7 +273,7 @@ async fn try_call(addr: SocketAddr, action: Action) -> Option<Response> {
     let payload = auth::encode(&action).await.ok()?;
     let request = auth::sign_request(&key(), payload);
     let nonce = request.nonce.clone();
-    let mut client = RpcClient::<Request>::new(addr).await.ok()?;
+    let mut client = RpcClient::<Request>::new_with_config(addr, tls_config(&key())).await.ok()?;
     let reply = client.call::<Reply>(request).await.ok()?;
     let payload = auth::verify_reply(&key(), &nonce, &reply).ok()?;
     auth::decode::<Response>(payload).await.ok()
