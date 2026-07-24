@@ -73,7 +73,7 @@ impl ServerStg {
         };
         fs::create_dir_all(ft.instances_dir()).await?;
         ft.save().await?;
-        let instances = ft.load_instances().await?;
+        let instances = ft.load_instances().await.map_err(|e| {anyhow::Error::msg("failed to read instance file. It might be out of date. Use `server purge-instances` to remove it.")})?;
         Ok((ft, instances))
     }
 
@@ -87,18 +87,27 @@ impl ServerStg {
         Ok(())
     }
 
-    pub async fn load(config_path: PathBuf) -> anyhow::Result<(Self, Vec<InstanceConfig>)> {
+    pub async fn load(config_path: &PathBuf) -> anyhow::Result<(Self, Vec<InstanceConfig>)> {
         let mut f = fs::File::options().read(true).open(&config_path).await?;
         let ft = ServerStg::deserialize(&mut f).await?;
         if ft.key.len() != protocol::auth::KEY_LEN {
             anyhow::bail!(
-                "this config has no usable authentication key — run `server -c {} keygen <phrase>`",
+                "this config has no usable authentication key - run `server -c {} keygen <phrase>`",
                 config_path.display(),
             );
         }
         fs::create_dir_all(ft.instances_dir()).await?;
         let instances = ft.load_instances().await?;
         Ok((ft, instances))
+    }
+
+    pub async fn purge_instances(config_path: &PathBuf) -> anyhow::Result<()> {
+        let mut f = fs::File::options().read(true).open(&config_path).await?;
+        let ft = ServerStg::deserialize(&mut f).await?;
+        if fs::try_exists(ft.instances_index_path()).await? {
+            fs::remove_file(ft.instances_index_path()).await?;
+        }
+        Ok(())
     }
 
     pub async fn load_instances(&self) -> anyhow::Result<Vec<InstanceConfig>> {

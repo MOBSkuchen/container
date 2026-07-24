@@ -33,6 +33,12 @@ pub enum Commands {
               long_help = "Use a key printed by `client keygen` verbatim, as hex.")]
         key: Option<String>,
     },
+    #[command(long_about = "Removes the instances file.", name = "purge-instances")]
+    PurgeInstances,
+    #[command(long_about = "Kills the server process running with this config (e.g. a bootstrapped \
+                            one that outlived its console), so the address frees up for a restart.",
+              name = "stop-runaway")]
+    StopRunaway,
 }
 
 fn _user_input_read_as<CastType: FromStr + Send + Sync + std::fmt::Debug>(term: &Term, initial: &str, default: Option<CastType>) -> anyhow::Result<CastType>

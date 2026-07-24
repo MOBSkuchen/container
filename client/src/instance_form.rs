@@ -42,11 +42,20 @@ pub fn build(existing: Option<&InstanceConfig>) -> Form {
         Some(Source::Upload { desc }) => (2, desc.clone(), String::new()),
     };
 
+    let s = if let Some(existing) = existing {
+        match existing.source {
+            Source::Git { .. } => "git url",
+            Source::Url { .. } => "download url",
+            Source::Upload { .. } => "local path",
+            Source::None => "git url, download url or a local path"
+        }
+    } else { "git url, download url or a local path" };
+
     let fields = vec![
         Field::text("Name", existing.map(|c| c.name.as_str()).unwrap_or("")),
         Field::select("Source", SOURCES.iter().map(|s| s.to_string()).collect(), source_index),
         Field::text("Location", location)
-            .hint("git/download URL, or a local path to upload"),
+            .hint(s),
         Field::text("Branch", branch)
             .hint("git only, blank = the repo's default"),
         Field::text("Command", existing.map(|c| c.command.as_str()).unwrap_or("")),
