@@ -8,6 +8,7 @@ use protocol::auth;
 use server::api::Api;
 use server::cli::{self, gather_value_routine, Commands};
 use server::manager::InstanceManager;
+use server::session_handler::SessionApi;
 use server::storage::{default_shell, ServerStg};
 
 async fn _init(config_file: PathBuf) -> anyhow::Result<()> {
@@ -122,6 +123,8 @@ async fn _start(config_path: PathBuf, bootstrap: bool) -> anyhow::Result<()> {
 
     let manager = InstanceManager::new(stg.clone(), instances);
     let handler = Api::new(stg.clone(), manager.clone());
+    // Same manager as the unary handler, so sessions and unary calls share state.
+    let session_handler = SessionApi::new(stg.clone(), manager.clone());
 
     // TLS identity derived from the shared key: the client pins it, so a peer
     // without the key cannot even complete the handshake.
@@ -132,6 +135,7 @@ async fn _start(config_path: PathBuf, bootstrap: bool) -> anyhow::Result<()> {
     let server = RpcServer::new(stg.addr, handler)
         .await
         .map_err(|e| anyhow::anyhow!("failed to bind {}: {:?}", stg.addr, e))?
+        .with_persistence(session_handler)
         // Bounded so stalled peers hold a slot only until the idle/request
         // timeouts reclaim it, instead of wedging the server.
         .with_config(ServerConfig {

@@ -3,7 +3,7 @@ pub mod cli;
 pub mod storage;
 pub mod manager;
 pub mod gitops;
-pub mod session;
+pub mod session_handler;
 pub mod sourceops;
 pub mod terminal;
 pub mod transfer;

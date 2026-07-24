@@ -12,11 +12,13 @@
 pub mod api;
 pub mod auth;
 pub mod instance;
+pub mod session;
 pub mod term;
 pub mod tls;
 
-pub use api::{Action, ApiError, DirEntry, ErrorCode, Response, TerminalMode};
+pub use api::{Action, ApiError, DirEntry, ErrorCode, Response};
 pub use auth::{AuthFailure, Reply, Request};
+pub use session::{Session, SessionStart};
 pub use instance::{
     ConsoleLine, GroupStats, InstanceConfig, InstanceStatResponse, InstanceStatus, RepoState,
     RetryPolicy, RunState, Source, Stream,

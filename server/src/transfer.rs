@@ -1,14 +1,15 @@
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::api::{ApiError, DirEntry, ErrorCode};
 use crate::storage::ServerStg;
 
-// Session protocol after the token handshake (both directions):
+// Transfer protocol on the session stream (see `protocol::session`):
 //   [u64 big-endian length][exactly that many bytes]
-// Download: server sends; upload: client sends. The socket closes afterwards.
+// Download: server sends; upload: client sends. The connection is not closed —
+// it is the persistent call's, reused for the reply — so there is no shutdown
+// here, and success is signalled by that reply rather than an ack byte.
 
 /// Validate a requested transfer path against the configured jail.
 ///
@@ -78,39 +79,50 @@ pub async fn list_dir(path: &Path) -> Result<Vec<DirEntry>, ApiError> {
     Ok(entries)
 }
 
-/// Session handler: stream `path` to the client, length-prefixed.
-pub async fn send_file(stream: TcpStream, path: PathBuf) {
-    if let Err(e) = send_inner(stream, &path).await {
-        eprintln!("download of '{}' failed: {e}", path.display());
-    }
-}
-
-async fn send_inner(mut stream: TcpStream, path: &Path) -> std::io::Result<()> {
+/// Stream `path` to the client, length-prefixed, and flush so it lands before
+/// the reply.
+pub async fn send_file<S: AsyncWrite + Unpin + Send>(s: &mut S, path: &Path) -> std::io::Result<()> {
     let mut file = fs::File::open(path).await?;
     let meta = file.metadata().await?;
-    stream.write_all(&meta.len().to_be_bytes()).await?;
-    tokio::io::copy(&mut file, &mut stream).await?;
-    stream.shutdown().await?;
+    s.write_all(&meta.len().to_be_bytes()).await?;
+    tokio::io::copy(&mut file, s).await?;
+    s.flush().await?;
     Ok(())
 }
 
-/// Session handler: receive a length-prefixed file into `path`. Data lands in
-/// a `.part` file first so a dropped connection never leaves a truncated file
-/// at the final path.
-pub async fn receive_file(stream: TcpStream, path: PathBuf) {
-    if let Err(e) = receive_inner(stream, &path).await {
-        eprintln!("upload to '{}' failed: {e}", path.display());
+/// Receive a length-prefixed file into `path`. Data lands in a `.part` file
+/// first so a dropped connection never leaves a truncated file at the final
+/// path.
+pub async fn receive_file<S: AsyncRead + Unpin + Send>(s: &mut S, path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+
+    let part = path.with_extension("part");
+    let received = receive_payload(s, &part).await;
+
+    match received {
+        Ok(()) => {
+            if path.exists() {
+                fs::remove_file(path).await?;
+            }
+            fs::rename(&part, path).await
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&part).await;
+            Err(e)
+        }
     }
 }
 
 /// Read one length-prefixed payload into `into`, verifying the byte count.
-async fn receive_payload(stream: &mut TcpStream, into: &Path) -> std::io::Result<()> {
+async fn receive_payload<S: AsyncRead + Unpin + Send>(s: &mut S, into: &Path) -> std::io::Result<()> {
     let mut len_buf = [0u8; 8];
-    stream.read_exact(&mut len_buf).await?;
+    s.read_exact(&mut len_buf).await?;
     let len = u64::from_be_bytes(len_buf);
 
     let mut file = fs::File::create(into).await?;
-    let mut limited = (&mut *stream).take(len);
+    let mut limited = (&mut *s).take(len);
     let copied = tokio::io::copy(&mut limited, &mut file).await?;
     if copied != len {
         return Err(std::io::Error::new(
@@ -121,66 +133,24 @@ async fn receive_payload(stream: &mut TcpStream, into: &Path) -> std::io::Result
     file.flush().await
 }
 
-async fn receive_inner(mut stream: TcpStream, path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-
-    let part = path.with_extension("part");
-    let received = receive_payload(&mut stream, &part).await;
-
-    let swapped = match received {
-        Ok(()) => async {
-            if path.exists() {
-                fs::remove_file(path).await?;
-            }
-            fs::rename(&part, path).await
-        }.await,
-        Err(e) => Err(e),
-    };
-    if let Err(e) = swapped {
-        let _ = fs::remove_file(&part).await;
-        return Err(e);
-    }
-
-    // Ack so the client knows the file was committed, not just sent. The file
-    // is already in place, so an ack failure is only worth a note.
-    if let Err(e) = stream.write_all(&[1u8]).await {
-        eprintln!("upload to '{}': committed, but the client ack failed: {e}", path.display());
-    }
-    let _ = stream.shutdown().await;
-    Ok(())
-}
-
 fn tmp_archive_path() -> PathBuf {
     std::env::temp_dir().join(format!("chld-transfer-{:016x}.tar.gz", rand::random::<u64>()))
 }
 
-/// Session handler: receive a tar.gz and unpack it into `dest`, acking only
-/// after the unpack so the client knows the files exist, not just the bytes.
-pub async fn receive_archive(mut stream: TcpStream, dest: PathBuf) -> std::io::Result<()> {
+/// Receive a tar.gz and unpack it into `dest`. Returning `Ok` means the files
+/// exist (the caller's reply is what tells the client so), not just the bytes.
+pub async fn receive_archive<S: AsyncRead + Unpin + Send>(s: &mut S, dest: &Path) -> std::io::Result<()> {
     let tmp = tmp_archive_path();
     let result = async {
-        fs::create_dir_all(&dest).await?;
-        receive_payload(&mut stream, &tmp).await?;
-        let (archive, into) = (tmp.clone(), dest.clone());
+        fs::create_dir_all(dest).await?;
+        receive_payload(s, &tmp).await?;
+        let (archive, into) = (tmp.clone(), dest.to_path_buf());
         tokio::task::spawn_blocking(move || unpack_blocking(&archive, &into))
             .await
             .map_err(|e| std::io::Error::other(format!("unpack task panicked: {e}")))?
     }.await;
     let _ = fs::remove_file(&tmp).await;
-
-    match result {
-        Ok(()) => {
-            let _ = stream.write_all(&[1u8]).await;
-            let _ = stream.shutdown().await;
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("archive upload into '{}' failed: {e}", dest.display());
-            Err(e)
-        }
-    }
+    result
 }
 
 fn unpack_blocking(archive: &Path, dest: &Path) -> std::io::Result<()> {
@@ -190,10 +160,9 @@ fn unpack_blocking(archive: &Path, dest: &Path) -> std::io::Result<()> {
     crate::unpack::untar(tar::Archive::new(flate2::read::GzDecoder::new(file)), dest)
 }
 
-/// Session handler: pack `paths` into a tar.gz, then stream it
-/// length-prefixed. Packing happens here rather than during the RPC so a
-/// large tree cannot run into the client's RPC timeout.
-pub async fn send_archive(stream: TcpStream, paths: Vec<PathBuf>) {
+/// Pack `paths` into a tar.gz, then stream it length-prefixed. Packing happens
+/// here rather than during the RPC so a large tree cannot run into a timeout.
+pub async fn send_archive<S: AsyncWrite + Unpin + Send>(s: &mut S, paths: Vec<PathBuf>) -> std::io::Result<()> {
     let tmp = tmp_archive_path();
     let packed = {
         let tmp = tmp.clone();
@@ -203,13 +172,11 @@ pub async fn send_archive(stream: TcpStream, paths: Vec<PathBuf>) {
             .and_then(|r| r)
     };
     let result = match packed {
-        Ok(()) => send_inner(stream, &tmp).await,
+        Ok(()) => send_file(s, &tmp).await,
         Err(e) => Err(e),
     };
     let _ = fs::remove_file(&tmp).await;
-    if let Err(e) = result {
-        eprintln!("archive download failed: {e}");
-    }
+    result
 }
 
 /// Entries are named by their final path component, so unpacking yields them

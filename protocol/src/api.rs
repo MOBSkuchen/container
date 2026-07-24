@@ -30,17 +30,6 @@ impl std::fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
-#[derive(Serialize, Deserialize, Debug)]
-pub enum TerminalMode {
-    /// Bridge to the running instance's stdin/stdout (`docker attach`-style).
-    /// Pipe-based and line-oriented, like the supervised process itself.
-    Attach(u128),
-    /// A fresh shell in the instance's repo dir (`docker exec`-style), run
-    /// under a real PTY. `cols`/`rows` size it at startup; the client resizes
-    /// it later over the session's own framing (see `protocol::term`).
-    Shell { id: u128, cols: u16, rows: u16 },
-}
-
 /// One entry of a `ListDir` result.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DirEntry {
@@ -75,12 +64,8 @@ pub enum Action {
         retry_policy: Option::<RetryPolicy>,
     },
     /// Re-materialize the source and swap it in (instance must be stopped).
-    /// Upload sources are refreshed with `UploadSource` instead.
+    /// Upload sources are refreshed with `Session::UploadSource` instead.
     UpdateRepo { id: u128 },
-    /// Client will push a tar.gz of an Upload instance's content over the
-    /// returned session; the server unpacks it into the instance's repo dir
-    /// and marks the instance ready. The instance must be stopped.
-    UploadSource { id: u128 },
     RunInstance { id: u128 },
     /// Stop (if running) and start again. On the self-managed instance this
     /// restarts the server itself: it hands over to a fresh process.
@@ -92,11 +77,6 @@ pub enum Action {
     RemoveInstance { id: u128, delete_files: bool },
     CheckInstance { id: u128 },
     ListInstances,
-    OpenTerminal { mode: TerminalMode },
-    /// Client will push a file to `dest` over the returned session.
-    UploadFile { dest: PathBuf },
-    /// Client will pull `src` over the returned session.
-    DownloadFile { src: PathBuf },
     /// Directory listing, subject to the same path jail as file transfers.
     ListDir { path: PathBuf },
     /// The tail of an instance's captured console output, newest last.
@@ -105,14 +85,6 @@ pub enum Action {
     /// spawns a replacement process and exits. Only honored when the server
     /// config enables bootstrapping.
     Bootstrap,
-    /// Client will push a tar.gz over the returned session; the server
-    /// unpacks it into `dest` and acks only once that has happened.
-    UploadArchive { dest: PathBuf },
-    /// Server packs `paths` (files or whole directories) into a tar.gz and
-    /// streams it over the returned session. Packing happens inside the
-    /// session, so the archive size arrives as the stream's length prefix
-    /// rather than in `SessionOpened`.
-    DownloadArchive { paths: Vec::<PathBuf> },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -141,15 +113,6 @@ pub enum Response {
     InstanceCreated { id: u128 },
     InstanceStatus(InstanceStatus),
     InstanceList(Vec<InstanceStatResponse>),
-    /// Connect to the same host on `port` within `ttl_secs`, send `token` as
-    /// the first 32 bytes, then wait for a 1-byte ack. `size` is the file
-    /// length for downloads.
-    SessionOpened {
-        port: u16,
-        token: Vec::<u8>,
-        ttl_secs: u64,
-        size: Option::<u64>,
-    },
     /// `path` is the resolved absolute directory that was listed.
     DirListing { path: PathBuf, entries: Vec::<DirEntry> },
     /// `dropped` counts lines already evicted from the ring buffer, so the

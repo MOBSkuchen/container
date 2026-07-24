@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use protocol::Action;
+use protocol::Session;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
@@ -38,7 +38,7 @@ pub async fn upload(
             .context("pack task panicked")?
     };
     let result = match packed {
-        Ok(()) => upload_archive(endpoint, &tmp, Action::UploadArchive { dest }, Some(&progress)).await,
+        Ok(()) => upload_archive(endpoint, &tmp, Session::UploadArchive { dest }, Some(progress)).await,
         Err(e) => Err(e).context("packing the selection"),
     };
     let _ = tokio::fs::remove_file(&tmp).await;
@@ -57,7 +57,7 @@ pub async fn upload_source(endpoint: &Endpoint, id: u128, path: PathBuf) -> anyh
             .context("pack task panicked")?
     };
     let result = match packed {
-        Ok(()) => upload_archive(endpoint, &tmp, Action::UploadSource { id }, None).await,
+        Ok(()) => upload_archive(endpoint, &tmp, Session::UploadSource { id }, None).await,
         Err(e) => Err(e).context("packing the content"),
     };
     let _ = tokio::fs::remove_file(&tmp).await;
@@ -67,37 +67,36 @@ pub async fn upload_source(endpoint: &Endpoint, id: u128, path: PathBuf) -> anyh
 async fn upload_archive(
     endpoint: &Endpoint,
     archive: &Path,
-    action: Action,
-    progress: Option<&Progress>,
+    session: Session,
+    progress: Option<Progress>,
 ) -> anyhow::Result<()> {
     let total = tokio::fs::metadata(archive).await.context("reading the packed archive")?.len();
-    if let Some(progress) = progress {
+    if let Some(progress) = &progress {
         let _ = progress.send((0, Some(total)));
     }
 
-    let mut stream = net::open_session(endpoint, action).await?;
-    let mut file = tokio::fs::File::open(archive).await.context("opening the packed archive")?;
-
-    stream.write_all(&total.to_be_bytes()).await.context("sending the archive size")?;
-    let mut sent = 0u64;
-    let mut buf = vec![0u8; CHUNK];
-    loop {
-        let n = file.read(&mut buf).await.context("reading the packed archive")?;
-        if n == 0 {
-            break;
+    let archive = archive.to_path_buf();
+    // Session success means the server unpacked and committed — its reply is
+    // the ack the old protocol sent as a byte.
+    net::session(endpoint, session, async move |_start, stream| {
+        let mut file = tokio::fs::File::open(&archive).await.context("opening the packed archive")?;
+        stream.write_all(&total.to_be_bytes()).await.context("sending the archive size")?;
+        let mut sent = 0u64;
+        let mut buf = vec![0u8; CHUNK];
+        loop {
+            let n = file.read(&mut buf).await.context("reading the packed archive")?;
+            if n == 0 {
+                break;
+            }
+            stream.write_all(&buf[..n]).await.context("the connection dropped mid-transfer")?;
+            sent += n as u64;
+            if let Some(progress) = &progress {
+                let _ = progress.send((sent, Some(total)));
+            }
         }
-        stream.write_all(&buf[..n]).await.context("the connection dropped mid-transfer")?;
-        sent += n as u64;
-        if let Some(progress) = progress {
-            let _ = progress.send((sent, Some(total)));
-        }
-    }
-
-    // The ack arrives only after the server has unpacked, so success here
-    // means the files exist, not just that the bytes were sent.
-    let mut ack = [0u8; 1];
-    stream.read_exact(&mut ack).await.context("the server did not confirm the unpack")?;
-    Ok(())
+        stream.flush().await.context("flushing the upload")?;
+        Ok(())
+    }).await
 }
 
 /// Pull `sources` (remote files or directories) into the local directory
@@ -108,30 +107,33 @@ pub async fn download(
     dest: PathBuf,
     progress: Progress,
 ) -> anyhow::Result<()> {
-    let mut stream = net::open_session(endpoint, Action::DownloadArchive { paths: sources }).await?;
-
-    let mut len_buf = [0u8; 8];
-    stream.read_exact(&mut len_buf).await.context("waiting for the server to pack")?;
-    let total = u64::from_be_bytes(len_buf);
-    let _ = progress.send((0, Some(total)));
-
     let tmp = tmp_archive_path();
-    let received = async {
-        let mut file = tokio::fs::File::create(&tmp).await.context("creating a temp archive")?;
-        let mut done = 0u64;
-        let mut buf = vec![0u8; CHUNK];
-        while done < total {
-            let want = CHUNK.min((total - done) as usize);
-            let n = stream.read(&mut buf[..want]).await.context("the connection dropped mid-transfer")?;
-            if n == 0 {
-                anyhow::bail!("connection closed after {done} of {total} bytes");
+    let received = {
+        let tmp = tmp.clone();
+        net::session(endpoint, Session::DownloadArchive { paths: sources }, async move |_start, stream| {
+            // The archive is packed live, so its size arrives as the stream's
+            // length prefix rather than in SessionStart.
+            let mut len_buf = [0u8; 8];
+            stream.read_exact(&mut len_buf).await.context("waiting for the server to pack")?;
+            let total = u64::from_be_bytes(len_buf);
+            let _ = progress.send((0, Some(total)));
+
+            let mut file = tokio::fs::File::create(&tmp).await.context("creating a temp archive")?;
+            let mut done = 0u64;
+            let mut buf = vec![0u8; CHUNK];
+            while done < total {
+                let want = CHUNK.min((total - done) as usize);
+                let n = stream.read(&mut buf[..want]).await.context("the connection dropped mid-transfer")?;
+                if n == 0 {
+                    anyhow::bail!("connection closed after {done} of {total} bytes");
+                }
+                file.write_all(&buf[..n]).await.context("writing the temp archive")?;
+                done += n as u64;
+                let _ = progress.send((done, Some(total)));
             }
-            file.write_all(&buf[..n]).await.context("writing the temp archive")?;
-            done += n as u64;
-            let _ = progress.send((done, Some(total)));
-        }
-        file.flush().await.context("writing the temp archive")
-    }.await;
+            file.flush().await.context("writing the temp archive")
+        }).await
+    };
 
     let result = match received {
         Ok(()) => {

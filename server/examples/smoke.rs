@@ -14,13 +14,17 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
-use bierpc::rpc::{ClientConfig, RpcClient};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use protocol::{auth, term, tls};
-use protocol::{AuthFailure, Reply, Request};
-use server::api::{Action, ErrorCode, Response, TerminalMode};
+use bierpc::rpc::{ClientConfig, ClientStream, RpcClient};
+use bierpc::serialize::Deserialize as _;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufStream};
+use protocol::term::{self, FrameReader, OwnedFrame};
+use protocol::{auth, tls};
+use protocol::{ApiError, AuthFailure, Reply, Request, Session, SessionStart};
+use server::api::{Action, ErrorCode, Response};
 use server::manager::{RepoState, RetryPolicy, RunState, Source};
+
+/// The live session stream — bierpc's persistent connection.
+type SStream = BufStream<ClientStream>;
 
 /// The shared key both ends are set up with; see `main`.
 const PHRASE: &str = "smoke-test-passphrase";
@@ -33,10 +37,10 @@ fn key() -> Vec<u8> {
     KEY.get_or_init(|| auth::hash_or_random(Some(PHRASE)).to_vec()).clone()
 }
 
-/// A TLS client config pinning the server identity derived from `key`.
+/// A mutual-TLS client config for the identity derived from `key`.
 fn tls_config(key: &[u8]) -> ClientConfig {
     ClientConfig {
-        tls: Some(tls::client_config(tls::Identity::derive(key).public_key())),
+        tls: Some(tls::Identity::derive(key).client_config().expect("client TLS identity")),
         ..Default::default()
     }
 }
@@ -80,76 +84,93 @@ fn expect_err(resp: &Response, code: ErrorCode, what: &str) {
     }
 }
 
-async fn open_session(addr: SocketAddr, resp: Response) -> (TcpStream, Option<u64>) {
-    let Response::SessionOpened { port, token, size, .. } = resp else {
-        panic!("expected SessionOpened, got {resp:?}");
-    };
-    let mut stream = TcpStream::connect((addr.ip(), port)).await.expect("session connect failed");
-    stream.write_all(&token).await.expect("token send failed");
-    let mut ack = [0u8; 1];
-    stream.read_exact(&mut ack).await.expect("no handshake ack");
-    assert_eq!(ack[0], 1, "bad handshake ack");
-    (stream, size)
+/// Run a side-channel session; the server's `SessionStart` and the live stream
+/// go to `body`, and the final reply comes back for the caller to check. On a
+/// rejection (`SessionStart(Err)`) `body` is skipped.
+async fn run_session<F>(addr: SocketAddr, session: Session, body: F) -> Response
+where
+    F: AsyncFnOnce(SessionStart, &mut SStream),
+{
+    let mut client = RpcClient::<Request, Session>::new_with_config(addr, tls_config(&key())).await
+        .expect("session connect failed");
+    client.call_persistent::<Response, _>(session, async |stream| {
+        let start = <Result<SessionStart, ApiError>>::deserialize(&mut *stream).await.expect("session start");
+        if let Ok(info) = start {
+            body(info, stream).await;
+        }
+        Ok(())
+    }).await.expect("session reply")
 }
 
-/// Read from a *pty* session until `needle` shows up, answering the
-/// cursor-position reports ConPTY asks for along the way.
-///
-/// ConPTY probes the terminal it believes it is attached to with `ESC[6n` and
-/// waits for a reply before getting on with things. The real client passes
-/// that through to an actual console, which answers by itself; a bare socket
-/// has to be told to.
-async fn pty_read_until(stream: &mut TcpStream, needle: &str, secs: u64) -> String {
+/// End our side of a terminal: send Close, then drain the peer's frames until
+/// its Close, leaving the stream aligned for the reply.
+async fn end_terminal(reader: &mut FrameReader, stream: &mut SStream) {
+    stream.write_all(&term::close_frame()).await.expect("send close");
+    stream.flush().await.expect("flush close");
+    while !matches!(reader.next(stream).await, Ok(None) | Ok(Some(OwnedFrame::Close)) | Err(_)) {}
+}
+
+/// Collect Data-frame payloads until `needle` appears (or Close/timeout).
+async fn read_frames_until(reader: &mut FrameReader, stream: &mut SStream, needle: &str, secs: u64) -> String {
+    let mut collected = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(timeout, reader.next(stream)).await {
+            Ok(Ok(Some(OwnedFrame::Data(bytes)))) => {
+                collected.extend_from_slice(&bytes);
+                if String::from_utf8_lossy(&collected).contains(needle) {
+                    break;
+                }
+            }
+            Ok(Ok(Some(OwnedFrame::Close))) | Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(Some(_))) => {}
+        }
+    }
+    String::from_utf8_lossy(&collected).into_owned()
+}
+
+/// Like `read_frames_until`, but answer the cursor-position reports ConPTY
+/// probes with (`ESC[6n`) — the real client's console answers on its own.
+async fn pty_read_frames_until(reader: &mut FrameReader, stream: &mut SStream, needle: &str, secs: u64) -> String {
     const DSR: &[u8] = b"\x1b[6n";
     let mut collected = Vec::new();
     let mut answered = 0usize;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
-    let mut buf = [0u8; 4096];
-
     loop {
         let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(timeout, stream.read(&mut buf)).await {
-            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-            Ok(Ok(n)) => {
-                collected.extend_from_slice(&buf[..n]);
-
+        match tokio::time::timeout(timeout, reader.next(stream)).await {
+            Ok(Ok(Some(OwnedFrame::Data(bytes)))) => {
+                collected.extend_from_slice(&bytes);
                 let asked = collected.windows(DSR.len()).filter(|w| *w == DSR).count();
                 while answered < asked {
-                    let reply = term::data_frame(b"\x1b[1;1R");
-                    if stream.write_all(&reply).await.is_err() {
-                        break;
-                    }
+                    stream.write_all(&term::data_frame(b"\x1b[1;1R")).await.expect("answer DSR");
+                    stream.flush().await.expect("flush DSR");
                     answered += 1;
                 }
-
                 if String::from_utf8_lossy(&collected).contains(needle) {
                     break;
                 }
             }
+            Ok(Ok(Some(OwnedFrame::Close))) | Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(Some(_))) => {}
         }
     }
     String::from_utf8_lossy(&collected).into_owned()
 }
 
-/// Read from the socket until `needle` shows up or `secs` elapse.
-async fn read_until(stream: &mut TcpStream, needle: &str, secs: u64) -> String {
-    let mut collected = Vec::new();
+/// Wait for the server's Close (the shell exiting sends one). Returns false on
+/// timeout.
+async fn wait_for_close(reader: &mut FrameReader, stream: &mut SStream, secs: u64) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
-    let mut buf = [0u8; 4096];
     loop {
         let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(timeout, stream.read(&mut buf)).await {
-            Ok(Ok(0)) | Err(_) => break,
-            Ok(Ok(n)) => {
-                collected.extend_from_slice(&buf[..n]);
-                if String::from_utf8_lossy(&collected).contains(needle) {
-                    break;
-                }
-            }
-            Ok(Err(_)) => break,
+        match tokio::time::timeout(timeout, reader.next(stream)).await {
+            Ok(Ok(Some(OwnedFrame::Close))) | Ok(Ok(None)) => return true,
+            Ok(Ok(Some(_))) => {}
+            Ok(Err(_)) | Err(_) => return false,
         }
     }
-    String::from_utf8_lossy(&collected).into_owned()
 }
 
 /// The auth layer is the only thing standing between the network and full
@@ -328,7 +349,7 @@ async fn run_bootstrap(addr: SocketAddr) {
     expect_err(&call(addr, Action::KillInstance { id: me.id }).await, ErrorCode::Conflict, "kill the self instance");
     expect_err(&call(addr, Action::UpdateRepo { id: me.id }).await, ErrorCode::Conflict, "update-repo on the self instance");
     expect_err(
-        &call(addr, Action::OpenTerminal { mode: TerminalMode::Attach(me.id) }).await,
+        &run_session(addr, Session::Attach(me.id), async |_, _| {}).await,
         ErrorCode::Conflict, "attach to the self instance",
     );
     expect_err(&call(addr, Action::Bootstrap).await, ErrorCode::Conflict, "double bootstrap");
@@ -524,55 +545,50 @@ async fn run_full(addr: SocketAddr) {
         other => panic!("tail-console failed: {other:?}"),
     }
 
-    // 3. Attach terminal.
-    let resp = call(addr, Action::OpenTerminal { mode: TerminalMode::Attach(id) }).await;
-    let (mut term, _) = open_session(addr, resp).await;
-    term.write_all(b"echo from-attach-terminal\r\n").await.unwrap();
-    let out = read_until(&mut term, "from-attach-terminal", 10).await;
-    assert!(out.contains("from-attach-terminal"), "attach terminal produced: {out:?}");
+    // 3. Attach terminal (framed both ways over the persistent session).
+    run_session(addr, Session::Attach(id), async |_start, term| {
+        let mut reader = FrameReader::new();
+        term.write_all(&term::data_frame(b"echo from-attach-terminal\r\n")).await.unwrap();
+        term.flush().await.unwrap();
+        let out = read_frames_until(&mut reader, term, "from-attach-terminal", 10).await;
+        assert!(out.contains("from-attach-terminal"), "attach terminal produced: {out:?}");
+        end_terminal(&mut reader, term).await;
+    }).await;
     println!("OK   attach terminal (echo round-trip)");
-    drop(term);
 
     // 4. Shell terminal: a real pty, independent of the instance process.
-    let resp = call(addr, Action::OpenTerminal {
-        mode: TerminalMode::Shell { id, cols: 80, rows: 24 },
+    run_session(addr, Session::Shell { id, cols: 80, rows: 24 }, async |_start, shell| {
+        let mut reader = FrameReader::new();
+
+        // A pty echoes what you type, so asserting on the command text would
+        // pass even if nothing ran. Assert on a result the input does not have.
+        shell.write_all(&term::data_frame(b"set /a 21*2\r\n")).await.unwrap();
+        shell.flush().await.unwrap();
+        let out = pty_read_frames_until(&mut reader, shell, "42", 10).await;
+        assert!(out.contains("42"), "shell did not evaluate the expression: {out:?}");
+        assert!(out.contains("set /a 21*2"), "a pty must echo the typed command back; got {out:?}");
+        println!("OK   shell terminal (pty runs commands and echoes)");
+
+        // Resize must reach the pty: ask the shell how wide it thinks it is.
+        // Matching the number, not a label — `mode con` output is localized.
+        shell.write_all(&term::resize_frame(120, 40)).await.unwrap();
+        shell.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        shell.write_all(&term::data_frame(b"mode con\r\n")).await.unwrap();
+        shell.flush().await.unwrap();
+        let out = pty_read_frames_until(&mut reader, shell, "120", 10).await;
+        assert!(out.contains("120"), "resize did not reach the pty; `mode con` said: {out:?}");
+        println!("OK   shell terminal (resize reaches the pty)");
+
+        // `exit` ends the shell, so the server sends a Close of its own accord.
+        shell.write_all(&term::data_frame(b"exit\r\n")).await.unwrap();
+        shell.flush().await.unwrap();
+        assert!(wait_for_close(&mut reader, shell, 10).await, "the session did not close after `exit`");
+        // Complete the handshake so the reply can be read.
+        shell.write_all(&term::close_frame()).await.unwrap();
+        shell.flush().await.unwrap();
+        println!("OK   shell terminal (`exit` closes the session)");
     }).await;
-    let (mut shell, _) = open_session(addr, resp).await;
-
-    // A pty echoes what you type, so asserting on the command text would pass
-    // even if nothing ran. Assert on a result the input does not contain.
-    shell.write_all(&term::data_frame(b"set /a 21*2\r\n")).await.unwrap();
-    let out = pty_read_until(&mut shell, "42", 10).await;
-    assert!(out.contains("42"), "shell did not evaluate the expression: {out:?}");
-    assert!(
-        out.contains("set /a 21*2"),
-        "a pty must echo the typed command back; got {out:?}",
-    );
-    println!("OK   shell terminal (pty runs commands and echoes)");
-
-    // Resize must reach the pty: ask the shell how wide it thinks it is.
-    // Matching the number, not a label — `mode con` output is localized.
-    shell.write_all(&term::resize_frame(120, 40)).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    shell.write_all(&term::data_frame(b"mode con\r\n")).await.unwrap();
-    let out = pty_read_until(&mut shell, "120", 10).await;
-    assert!(out.contains("120"), "resize did not reach the pty; `mode con` said: {out:?}");
-    println!("OK   shell terminal (resize reaches the pty)");
-
-    // Typing `exit` ends the session, exactly as in a normal terminal.
-    shell.write_all(&term::data_frame(b"exit\r\n")).await.unwrap();
-    let mut sink = [0u8; 1024];
-    let closed = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match shell.read(&mut sink).await {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {}
-            }
-        }
-    }).await;
-    assert!(closed.is_ok(), "the session did not close after `exit`");
-    println!("OK   shell terminal (`exit` closes the session)");
-    drop(shell);
 
     // 4b. Restart: same instance, fresh process.
     let old_pid = match call(addr, Action::CheckInstance { id }).await {
@@ -600,41 +616,31 @@ async fn run_full(addr: SocketAddr) {
     let new_pid = new_pid.expect("instance did not come back with a new pid after restart");
     println!("OK   restart (pid {} → {new_pid})", old_pid.unwrap_or(0));
 
-    // 5. A wrong session token must be dropped without an ack.
-    let resp = call(addr, Action::OpenTerminal {
-        mode: TerminalMode::Shell { id, cols: 80, rows: 24 },
-    }).await;
-    let Response::SessionOpened { port, .. } = resp else { panic!("expected SessionOpened") };
-    let mut bad = TcpStream::connect((addr.ip(), port)).await.unwrap();
-    bad.write_all(&[0u8; 32]).await.unwrap();
-    let mut ack = [0u8; 1];
-    match tokio::time::timeout(Duration::from_secs(3), bad.read(&mut ack)).await {
-        Ok(Ok(0)) => println!("OK   wrong token: connection dropped"),
-        Err(_) => println!("OK   wrong token: no ack within timeout"),
-        other => panic!("wrong token was not rejected: {other:?}"),
-    }
-
-    // 6. File transfer: upload into the instances jail, download, compare.
+    // 5. File transfer: upload into the instances jail, download, compare.
+    //    (mTLS replaces the old per-session token, so there is no bad-token
+    //    path to test — an unauthenticated peer cannot even handshake.)
     let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
     let dest = PathBuf::from(format!("instances/{id:032x}/repo/smoke-upload.bin"));
 
-    let resp = call(addr, Action::UploadFile { dest: dest.clone() }).await;
-    let (mut up, _) = open_session(addr, resp).await;
-    up.write_all(&(payload.len() as u64).to_be_bytes()).await.unwrap();
-    up.write_all(&payload).await.unwrap();
-    let mut ack = [0u8; 1];
-    up.read_exact(&mut ack).await.expect("no upload commit ack");
-    assert_eq!(ack[0], 1);
+    // The reply is the commit ack: Done means the file is in place.
+    let up = run_session(addr, Session::UploadFile { dest: dest.clone() }, async |_start, up| {
+        up.write_all(&(payload.len() as u64).to_be_bytes()).await.unwrap();
+        up.write_all(&payload).await.unwrap();
+        up.flush().await.unwrap();
+    }).await;
+    assert!(matches!(up, Response::Done), "upload not committed: {up:?}");
     println!("OK   upload ({} bytes committed)", payload.len());
 
-    let resp = call(addr, Action::DownloadFile { src: dest.clone() }).await;
-    let (mut down, size) = open_session(addr, resp).await;
-    assert_eq!(size, Some(payload.len() as u64), "download size mismatch in response");
-    let mut len_buf = [0u8; 8];
-    down.read_exact(&mut len_buf).await.unwrap();
-    assert_eq!(u64::from_be_bytes(len_buf), payload.len() as u64);
-    let mut got = vec![0u8; payload.len()];
-    down.read_exact(&mut got).await.unwrap();
+    let mut got = Vec::new();
+    let down = run_session(addr, Session::DownloadFile { src: dest.clone() }, async |start, down| {
+        assert_eq!(start.size, Some(payload.len() as u64), "download size mismatch in SessionStart");
+        let mut len_buf = [0u8; 8];
+        down.read_exact(&mut len_buf).await.unwrap();
+        assert_eq!(u64::from_be_bytes(len_buf), payload.len() as u64);
+        got = vec![0u8; payload.len()];
+        down.read_exact(&mut got).await.unwrap();
+    }).await;
+    assert!(matches!(down, Response::Done), "download failed: {down:?}");
     assert_eq!(got, payload, "downloaded bytes differ");
     println!("OK   download (round-trip matches)");
 
@@ -672,13 +678,14 @@ async fn run_full(addr: SocketAddr) {
         other => panic!("check failed: {other:?}"),
     }
 
-    // Path jail: escapes and out-of-root paths must be rejected.
+    // Path jail: escapes and out-of-root paths must be rejected (now in the
+    // session's SessionStart, surfaced as the reply).
     expect_err(
-        &call(addr, Action::DownloadFile { src: PathBuf::from("instances/../../secret.txt") }).await,
+        &run_session(addr, Session::DownloadFile { src: PathBuf::from("instances/../../secret.txt") }, async |_, _| {}).await,
         ErrorCode::AccessDenied, "path traversal",
     );
     expect_err(
-        &call(addr, Action::DownloadFile { src: PathBuf::from("C:\\Windows\\win.ini") }).await,
+        &run_session(addr, Session::DownloadFile { src: PathBuf::from("C:\\Windows\\win.ini") }, async |_, _| {}).await,
         ErrorCode::AccessDenied, "out-of-root absolute path",
     );
 
@@ -698,13 +705,12 @@ async fn run_full(addr: SocketAddr) {
     }
 
     let dest_dir = PathBuf::from(format!("instances/{id:032x}/repo"));
-    let resp = call(addr, Action::UploadArchive { dest: dest_dir.clone() }).await;
-    let (mut up, _) = open_session(addr, resp).await;
-    up.write_all(&(tarball.len() as u64).to_be_bytes()).await.unwrap();
-    up.write_all(&tarball).await.unwrap();
-    let mut ack = [0u8; 1];
-    up.read_exact(&mut ack).await.expect("no unpack ack");
-    assert_eq!(ack[0], 1);
+    let up = run_session(addr, Session::UploadArchive { dest: dest_dir.clone() }, async |_start, up| {
+        up.write_all(&(tarball.len() as u64).to_be_bytes()).await.unwrap();
+        up.write_all(&tarball).await.unwrap();
+        up.flush().await.unwrap();
+    }).await;
+    assert!(matches!(up, Response::Done), "archive upload failed: {up:?}");
     match call(addr, Action::ListDir { path: dest_dir.join("smoke-tree") }).await {
         Response::DirListing { entries, .. } => {
             assert!(entries.iter().any(|e| e.name == "a.txt" && !e.is_dir), "a.txt missing after unpack");
@@ -714,15 +720,16 @@ async fn run_full(addr: SocketAddr) {
     }
     println!("OK   archive upload (unpacked server-side)");
 
-    let resp = call(addr, Action::DownloadArchive { paths: vec![
+    let mut archive = Vec::new();
+    run_session(addr, Session::DownloadArchive { paths: vec![
         dest_dir.join("smoke-tree"),
         dest_dir.join("smoke-upload.bin"),
-    ] }).await;
-    let (mut down, _) = open_session(addr, resp).await;
-    let mut len_buf = [0u8; 8];
-    down.read_exact(&mut len_buf).await.expect("no archive length");
-    let mut archive = vec![0u8; u64::from_be_bytes(len_buf) as usize];
-    down.read_exact(&mut archive).await.expect("archive cut short");
+    ] }, async |_start, down| {
+        let mut len_buf = [0u8; 8];
+        down.read_exact(&mut len_buf).await.expect("no archive length");
+        archive = vec![0u8; u64::from_be_bytes(len_buf) as usize];
+        down.read_exact(&mut archive).await.expect("archive cut short");
+    }).await;
 
     let unpacked = std::env::temp_dir().join(format!("smoke-unpack-{:08x}", rand::random::<u32>()));
     tar::Archive::new(flate2::read::GzDecoder::new(&archive[..])).unpack(&unpacked).unwrap();
@@ -732,7 +739,7 @@ async fn run_full(addr: SocketAddr) {
     println!("OK   archive download (round-trip matches)");
 
     expect_err(
-        &call(addr, Action::DownloadArchive { paths: vec![PathBuf::from("C:\\Windows")] }).await,
+        &run_session(addr, Session::DownloadArchive { paths: vec![PathBuf::from("C:\\Windows")] }, async |_, _| {}).await,
         ErrorCode::AccessDenied, "archive out-of-root",
     );
     let _ = std::fs::remove_dir_all(&tree);
@@ -783,13 +790,12 @@ async fn run_full(addr: SocketAddr) {
     expect_err(&call(addr, Action::UpdateRepo { id: up_id }).await,
         ErrorCode::Conflict, "update-repo on an upload source");
 
-    let resp = call(addr, Action::UploadSource { id: up_id }).await;
-    let (mut push, _) = open_session(addr, resp).await;
-    push.write_all(&(tarball.len() as u64).to_be_bytes()).await.unwrap();
-    push.write_all(&tarball).await.unwrap();
-    let mut ack = [0u8; 1];
-    push.read_exact(&mut ack).await.expect("no source unpack ack");
-    assert_eq!(ack[0], 1);
+    let push = run_session(addr, Session::UploadSource { id: up_id }, async |_start, push| {
+        push.write_all(&(tarball.len() as u64).to_be_bytes()).await.unwrap();
+        push.write_all(&tarball).await.unwrap();
+        push.flush().await.unwrap();
+    }).await;
+    assert!(matches!(push, Response::Done), "source push failed: {push:?}");
     wait_repo_ready(addr, up_id).await;
     match call(addr, Action::ListDir {
         path: PathBuf::from(format!("instances/{up_id:032x}/repo/smoke-tree")),

@@ -4,18 +4,21 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
-use anyhow::Context;
 use bierpc::error::RpcError;
-use bierpc::rpc::{ClientConfig, RpcClient};
+use bierpc::rpc::{ClientConfig, ClientStream, RpcClient};
+use bierpc::serialize::Deserialize;
 use protocol::{auth, tls};
 use protocol::{
     Action, ApiError, AuthFailure, ConsoleLine, DirEntry, InstanceStatResponse, InstanceStatus,
-    Reply, Request, Response,
+    Reply, Request, Response, Session, SessionStart,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::BufStream;
 
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The live, mutually-authenticated stream a side-channel session runs over —
+/// bierpc's persistent connection, reused for the call's reply afterwards.
+pub type SessionStream = BufStream<ClientStream>;
 
 fn client_config(key: &[u8]) -> ClientConfig {
     ClientConfig {
@@ -23,9 +26,10 @@ fn client_config(key: &[u8]) -> ClientConfig {
         call_timeout: Some(RPC_TIMEOUT),
         // Console tails and large directory listings outgrow the 1 MiB default.
         max_message_bytes: 8 * 1024 * 1024,
-        // Pin the server identity derived from the same key. A server with a
-        // different key cannot complete the handshake.
-        tls: Some(tls::client_config(tls::Identity::derive(key).public_key())),
+        // Mutual TLS pinned to the identity derived from this key: a server
+        // with a different key cannot complete the handshake, and the same
+        // cert authenticates us on the (HMAC-less) persistent path.
+        tls: Some(tls::Identity::derive(key).client_config().expect("building the client TLS identity")),
         ..Default::default()
     }
 }
@@ -243,31 +247,40 @@ pub async fn list_dir(endpoint: &Endpoint, path: PathBuf) -> Result<(PathBuf, Ve
     }
 }
 
-/// Ask for a side-channel session and complete its token handshake.
-/// The stream is ready for the session protocol when this returns.
-pub async fn open_session(endpoint: &Endpoint, action: Action) -> anyhow::Result<TcpStream> {
+/// Run a side-channel `session` over a fresh mutually-authenticated
+/// connection. The server validates first (sending `SessionStart`); on success
+/// `body` gets that and the live stream to speak the session protocol over.
+pub async fn session<F>(endpoint: &Endpoint, action: Session, body: F) -> anyhow::Result<()>
+where
+    F: AsyncFnOnce(SessionStart, &mut SessionStream) -> anyhow::Result<()>,
+{
     let addr = endpoint.addr;
-    let (port, token, ttl_secs) = match call(endpoint, action).await {
-        Ok(Response::SessionOpened { port, token, ttl_secs, .. }) => (port, token, ttl_secs),
-        Ok(other) => anyhow::bail!("expected a session offer, got {other:?}"),
-        Err(e) => anyhow::bail!("{e}"),
-    };
+    let mut client = RpcClient::<Request, Session>::new_with_config(addr, client_config(&endpoint.key)).await
+        .map_err(|e| anyhow::anyhow!("{}", connect_error(addr, e)))?;
 
-    let mut stream = tokio::time::timeout(
-        Duration::from_secs(ttl_secs.max(1)),
-        TcpStream::connect((addr.ip(), port)),
-    ).await
-        .with_context(|| format!("session port {port} did not accept a connection within {ttl_secs}s"))?
-        .with_context(|| format!("connecting to session port {port}"))?;
+    // The body's own error (as opposed to a transport error) is captured here
+    // so its context survives, rather than collapsing to a generic RpcError.
+    let mut body_err: Option<anyhow::Error> = None;
+    let outcome = client.call_persistent::<Response, _>(action, async |stream| {
+        let start = Result::<SessionStart, ApiError>::deserialize(&mut *stream).await
+            .map_err(RpcError::from)?;
+        // On rejection, leave the stream untouched — the reply carries the same
+        // error and is read next.
+        if let Ok(info) = start
+            && let Err(e) = body(info, stream).await {
+            body_err = Some(e);
+            return Err(RpcError::IoError { err: std::io::Error::other("session body failed") });
+        }
+        Ok(())
+    }).await;
 
-    // Nagle would batch a keystroke and its echo into visible typing lag.
-    let _ = stream.set_nodelay(true);
-
-    stream.write_all(&token).await.context("sending the session token")?;
-    let mut ack = [0u8; 1];
-    stream.read_exact(&mut ack).await.context("the server closed the session without acknowledging it")?;
-    if ack[0] != 1 {
-        anyhow::bail!("the server rejected the session token");
+    if let Some(e) = body_err {
+        return Err(e);
     }
-    Ok(stream)
+    match outcome {
+        Ok(Response::Done) => Ok(()),
+        Ok(Response::Error(e)) => Err(anyhow::anyhow!("{e}")),
+        Ok(other) => anyhow::bail!("unexpected session reply: {other:?}"),
+        Err(e) => Err(anyhow::anyhow!("session failed: {}", rpc_detail(&e))),
+    }
 }

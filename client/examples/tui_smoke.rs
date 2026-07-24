@@ -17,17 +17,16 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, watch, Notify};
 
 use client::app::{App, AppEvent, Row, Screen, spawn_poller};
 use client::book::Book;
-use client::net::{Endpoint, NetError};
+use client::net::{self, Endpoint, NetError, SessionStream};
 use client::target;
 use client::terminal as terminal_mod;
-use protocol::{auth, term};
-use protocol::{Action, ErrorCode, RepoState, Response, RetryPolicy, RunState, Source, TerminalMode};
+use protocol::term::{self, FrameReader, OwnedFrame};
+use protocol::{auth, Action, ErrorCode, RepoState, Response, RetryPolicy, RunState, Session, Source};
 
 const INSTANCE: &str = "tui-smoke";
 /// Must match the phrase the test server was created with.
@@ -254,33 +253,37 @@ async fn main() {
     assert_eq!(bare.instance.id, id, "bare name resolved to the wrong instance");
     println!("OK   target resolution (qualified and bare)");
 
-    let mut attach = terminal_mod::open_session(&endpoint(addr), TerminalMode::Attach(id)).await
-        .expect("opening an attach session failed");
-    attach.write_all(b"echo from-attach\r\n").await.unwrap();
-    let out = read_until(&mut attach, "from-attach", 10).await;
-    assert!(out.contains("from-attach"), "attach session produced: {out:?}");
+    net::session(&endpoint(addr), Session::Attach(id), async |_start, attach| {
+        let mut reader = FrameReader::new();
+        attach.write_all(&term::data_frame(b"echo from-attach\r\n")).await.unwrap();
+        attach.flush().await.unwrap();
+        let out = read_frames_until(&mut reader, attach, "from-attach", 10).await;
+        assert!(out.contains("from-attach"), "attach session produced: {out:?}");
+        end_terminal(&mut reader, attach).await;
+        Ok(())
+    }).await.expect("attach session failed");
     println!("OK   attach session round-trip");
 
-    // Ctrl+C in the real client just drops the socket. The instance must
-    // survive that — this is the whole point of the terminal rework.
-    drop(attach);
+    // Detaching (the real client's Ctrl+C) must leave the instance running —
+    // this is the whole point of the terminal rework.
     tokio::time::sleep(Duration::from_secs(1)).await;
     match client::net::check(&endpoint(addr), id).await.expect("check after detach failed").run {
         RunState::Running { .. } => println!("OK   detaching leaves the instance running"),
         other => panic!("FAIL detach killed the instance: {other:?}"),
     }
 
-    // The shell session is a pty and is framed, unlike attach. It echoes, so
-    // the assertion is on a result the input does not contain.
+    // The shell session is a pty. It echoes, so the assertion is on a result
+    // the input does not contain.
     let (cols, rows) = terminal_mod::window_size();
-    let mut shell = terminal_mod::open_session(
-        &endpoint(addr),
-        TerminalMode::Shell { id, cols, rows },
-    ).await.expect("opening a shell session failed");
-    shell.write_all(&term::data_frame(b"set /a 21*2\r\n")).await.unwrap();
-    let out = pty_read_until(&mut shell, "42", 10).await;
-    assert!(out.contains("42"), "shell did not evaluate the expression: {out:?}");
-    drop(shell);
+    net::session(&endpoint(addr), Session::Shell { id, cols, rows }, async |_start, shell| {
+        let mut reader = FrameReader::new();
+        shell.write_all(&term::data_frame(b"set /a 21*2\r\n")).await.unwrap();
+        shell.flush().await.unwrap();
+        let out = pty_read_frames_until(&mut reader, shell, "42", 10).await;
+        assert!(out.contains("42"), "shell did not evaluate the expression: {out:?}");
+        end_terminal(&mut reader, shell).await;
+        Ok(())
+    }).await.expect("shell session failed");
     println!("OK   shell session round-trip (pty)");
 
     // 11b. The console panel shows what the instance printed, without any
@@ -449,55 +452,61 @@ async fn wait_console(app: &mut App, rx: &mut mpsc::Receiver<AppEvent>, needle: 
 /// waits for a reply before getting on with things. The real client passes
 /// that through to an actual console, which answers by itself; a bare socket
 /// has to be told to.
-async fn pty_read_until(stream: &mut TcpStream, needle: &str, secs: u64) -> String {
+async fn pty_read_frames_until(reader: &mut FrameReader, stream: &mut SessionStream, needle: &str, secs: u64) -> String {
     const DSR: &[u8] = b"\x1b[6n";
     let mut collected = Vec::new();
     let mut answered = 0usize;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
-    let mut buf = [0u8; 4096];
-
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(left, stream.read(&mut buf)).await {
-            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-            Ok(Ok(n)) => {
-                collected.extend_from_slice(&buf[..n]);
-
+        match tokio::time::timeout(left, reader.next(stream)).await {
+            Ok(Ok(Some(OwnedFrame::Data(bytes)))) => {
+                collected.extend_from_slice(&bytes);
                 let asked = collected.windows(DSR.len()).filter(|w| *w == DSR).count();
                 while answered < asked {
                     if stream.write_all(&term::data_frame(b"\x1b[1;1R")).await.is_err() {
                         break;
                     }
+                    let _ = stream.flush().await;
                     answered += 1;
                 }
-
                 if String::from_utf8_lossy(&collected).contains(needle) {
                     break;
                 }
             }
+            Ok(Ok(Some(OwnedFrame::Close))) | Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(Some(_))) => {}
         }
     }
     String::from_utf8_lossy(&collected).into_owned()
 }
 
-/// Read from a session socket until `needle` shows up or `secs` elapse.
-async fn read_until(stream: &mut TcpStream, needle: &str, secs: u64) -> String {
+/// Collect Data-frame payloads until `needle` shows up or `secs` elapse.
+async fn read_frames_until(reader: &mut FrameReader, stream: &mut SessionStream, needle: &str, secs: u64) -> String {
     let mut collected = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
-    let mut buf = [0u8; 4096];
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(left, stream.read(&mut buf)).await {
-            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-            Ok(Ok(n)) => {
-                collected.extend_from_slice(&buf[..n]);
+        match tokio::time::timeout(left, reader.next(stream)).await {
+            Ok(Ok(Some(OwnedFrame::Data(bytes)))) => {
+                collected.extend_from_slice(&bytes);
                 if String::from_utf8_lossy(&collected).contains(needle) {
                     break;
                 }
             }
+            Ok(Ok(Some(OwnedFrame::Close))) | Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(Some(_))) => {}
         }
     }
     String::from_utf8_lossy(&collected).into_owned()
+}
+
+/// End our side of a terminal: send Close, then drain the peer's frames until
+/// its Close, aligning the stream for the reply.
+async fn end_terminal(reader: &mut FrameReader, stream: &mut SessionStream) {
+    stream.write_all(&term::close_frame()).await.expect("send close");
+    stream.flush().await.expect("flush close");
+    while !matches!(reader.next(stream).await, Ok(None) | Ok(Some(OwnedFrame::Close)) | Err(_)) {}
 }
 
 async fn create_instance(addr: SocketAddr) -> u128 {

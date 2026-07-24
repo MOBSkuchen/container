@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use bierpc::error::RpcResult;
 use bierpc::rpc::RpcServerHandler;
 use std::sync::Mutex;
@@ -8,10 +7,10 @@ use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, Networks, RefreshKind, S
 use protocol::auth;
 use crate::manager::{InstanceManager, InstancePatch};
 use crate::storage::{ServerStg, InstanceConfig};
-use crate::{session, terminal, transfer};
+use crate::transfer;
 
 // The wire types live in the `protocol` crate, shared with the client.
-pub use protocol::api::{Action, ApiError, DirEntry, ErrorCode, Response, TerminalMode};
+pub use protocol::api::{Action, ApiError, DirEntry, ErrorCode, Response};
 pub use protocol::auth::{Reply, Request};
 
 type RR = RpcResult<Response>;
@@ -51,10 +50,6 @@ impl Api {
             disks: Arc::new(Mutex::new(Disks::new_with_refreshed_list())),
             replay: auth::ReplayGuard::new(),
         }
-    }
-
-    fn session_ttl(&self) -> Duration {
-        Duration::from_secs(self.stg.session_ttl_secs)
     }
 
     pub async fn ping(&self) -> RR {
@@ -109,147 +104,10 @@ impl Api {
         })
     }
 
-    async fn open_terminal(&self, mode: TerminalMode) -> Result<Response, ApiError> {
-        let offer = match mode {
-            TerminalMode::Attach(id) => {
-                let (output_rx, stdin_slot) = self.manager.attach_handles(id).await?;
-                session::open(self.session_ttl(), move |stream| {
-                    terminal::attach_bridge(stream, output_rx, stdin_slot)
-                }).await
-            }
-            TerminalMode::Shell { id, cols, rows } => {
-                let cwd = self.manager.repo_dir_of(id).await?;
-                let shell = self.stg.shell.clone();
-                session::open(self.session_ttl(), move |stream| {
-                    terminal::shell_bridge(stream, shell, cwd, cols, rows)
-                }).await
-            }
-        }.map_err(|e| ApiError {
-            code: ErrorCode::Internal,
-            msg: format!("opening session listener: {e}"),
-        })?;
-
-        Ok(Response::SessionOpened {
-            port: offer.port,
-            token: offer.token,
-            ttl_secs: offer.ttl_secs,
-            size: None,
-        })
-    }
-
-    async fn upload_file(&self, dest: PathBuf) -> Result<Response, ApiError> {
-        let path = transfer::resolve_path(&self.stg, &dest)?;
-        let offer = session::open(self.session_ttl(), move |stream| {
-            transfer::receive_file(stream, path)
-        }).await.map_err(|e| ApiError {
-            code: ErrorCode::Internal,
-            msg: format!("opening session listener: {e}"),
-        })?;
-
-        Ok(Response::SessionOpened {
-            port: offer.port,
-            token: offer.token,
-            ttl_secs: offer.ttl_secs,
-            size: None,
-        })
-    }
-
-    async fn download_file(&self, src: PathBuf) -> Result<Response, ApiError> {
-        let path = transfer::resolve_path(&self.stg, &src)?;
-        let size = tokio::fs::metadata(&path).await
-            .map_err(|e| ApiError {
-                code: ErrorCode::NotFound,
-                msg: format!("cannot read '{}': {e}", path.display()),
-            })?
-            .len();
-        let offer = session::open(self.session_ttl(), move |stream| {
-            transfer::send_file(stream, path)
-        }).await.map_err(|e| ApiError {
-            code: ErrorCode::Internal,
-            msg: format!("opening session listener: {e}"),
-        })?;
-
-        Ok(Response::SessionOpened {
-            port: offer.port,
-            token: offer.token,
-            ttl_secs: offer.ttl_secs,
-            size: Some(size),
-        })
-    }
-
     async fn list_dir(&self, requested: PathBuf) -> Result<Response, ApiError> {
         let path = transfer::resolve_path(&self.stg, &requested)?;
         let entries = transfer::list_dir(&path).await?;
         Ok(Response::DirListing { path, entries })
-    }
-
-    async fn upload_archive(&self, dest: PathBuf) -> Result<Response, ApiError> {
-        let dir = transfer::resolve_path(&self.stg, &dest)?;
-        let offer = session::open(self.session_ttl(), move |stream| async move {
-            let _ = transfer::receive_archive(stream, dir).await;
-        }).await.map_err(|e| ApiError {
-            code: ErrorCode::Internal,
-            msg: format!("opening session listener: {e}"),
-        })?;
-
-        Ok(Response::SessionOpened {
-            port: offer.port,
-            token: offer.token,
-            ttl_secs: offer.ttl_secs,
-            size: None,
-        })
-    }
-
-    /// Content push for an Upload-source instance. The instance flips to
-    /// Provisioning only once the client actually connects, so an unused
-    /// offer leaves it untouched.
-    async fn upload_source(&self, id: u128) -> Result<Response, ApiError> {
-        self.manager.begin_source_upload(id, false).await?;
-        let manager = self.manager.clone();
-        let offer = session::open(self.session_ttl(), move |stream| async move {
-            let dir = match manager.begin_source_upload(id, true).await {
-                Ok(dir) => dir,
-                Err(e) => {
-                    eprintln!("source upload for {id:032x} refused at connect time: {}", e.msg);
-                    return;
-                }
-            };
-            let result = transfer::receive_archive(stream, dir).await
-                .map_err(|e| e.to_string());
-            manager.finish_source_upload(id, result).await;
-        }).await.map_err(|e| ApiError {
-            code: ErrorCode::Internal,
-            msg: format!("opening session listener: {e}"),
-        })?;
-
-        Ok(Response::SessionOpened {
-            port: offer.port,
-            token: offer.token,
-            ttl_secs: offer.ttl_secs,
-            size: None,
-        })
-    }
-
-    async fn download_archive(&self, paths: Vec<PathBuf>) -> Result<Response, ApiError> {
-        if paths.is_empty() {
-            return Err(ApiError { code: ErrorCode::NotFound, msg: "nothing to download".to_string() });
-        }
-        let resolved = paths.iter()
-            .map(|p| transfer::resolve_path(&self.stg, p))
-            .collect::<Result<Vec<_>, _>>()?;
-        let offer = session::open(self.session_ttl(), move |stream| {
-            transfer::send_archive(stream, resolved)
-        }).await.map_err(|e| ApiError {
-            code: ErrorCode::Internal,
-            msg: format!("opening session listener: {e}"),
-        })?;
-
-        Ok(Response::SessionOpened {
-            port: offer.port,
-            token: offer.token,
-            ttl_secs: offer.ttl_secs,
-            size: None,
-        })
     }
 }
 
@@ -305,7 +163,6 @@ impl Api {
                 respond(self.manager.update_config(id, patch).await.map(|_| Response::Done))
             }
             Action::UpdateRepo { id } => respond(self.manager.update_repo(id).await.map(|_| Response::Done)),
-            Action::UploadSource { id } => respond(self.upload_source(id).await),
             Action::RunInstance { id } => respond(self.manager.run(id).await.map(|_| Response::Done)),
             Action::RestartInstance { id } => respond(self.manager.restart(id).await.map(|_| Response::Done)),
             Action::StopInstance { id } => respond(self.manager.stop(id).await.map(|_| Response::Done)),
@@ -329,11 +186,6 @@ impl Api {
                 }
                 respond(self.manager.bootstrap().await.map(|_| Response::Done))
             }
-            Action::OpenTerminal { mode } => respond(self.open_terminal(mode).await),
-            Action::UploadFile { dest } => respond(self.upload_file(dest).await),
-            Action::DownloadFile { src } => respond(self.download_file(src).await),
-            Action::UploadArchive { dest } => respond(self.upload_archive(dest).await),
-            Action::DownloadArchive { paths } => respond(self.download_archive(paths).await),
             Action::ListDir { path } => respond(self.list_dir(path).await),
             Action::TailConsole { id, lines } => {
                 respond(self.manager.tail_console(id, lines as usize).await

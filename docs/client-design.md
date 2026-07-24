@@ -162,9 +162,9 @@ servers.
   The persistent `System` also stops `stat` from walking the whole process
   table on every poll. The very first `Stat` after boot still reports a CPU
   figure from a single sample; it is correct from the second poll on.
-- **Session channel** (terminals & transfers): connect to `(server_ip, port)`
-  from `SessionOpened`, send the 32-byte token, wait for the 1-byte ack —
-  within `ttl_secs`.
+- **Session channel** (terminals & transfers): a persistent call on the same
+  mutually-authenticated connection (`protocol::session`), opened after reading
+  the server's `SessionStart`.
 
 ### 3.3 State model
 
@@ -294,10 +294,10 @@ two servers is an error listing both, never a silent pick. Instance ids
 skipped and mentioned in the error rather than aborting the lookup — one
 server being down should not stop you attaching to another.
 
-**Flow**: `OpenTerminal { mode }` → `SessionOpened { port, token, ttl_secs }`
-→ connect to that port, send the 32-byte token, read the 1-byte ack. That is
-`terminal::open_session`, split out from the bridge so it can be exercised
-without a TTY.
+**Flow**: `net::session(Session::Shell/Attach, …)` opens a persistent call on a
+fresh mutually-authenticated connection, reads the server's `SessionStart`, and
+runs the pump over the same stream (`protocol::session`, `§8`). No separate
+port or token — mTLS authenticates the caller.
 
 The two modes differ because what is on the far end differs.
 
@@ -311,11 +311,12 @@ is a dumb conduit and full-screen programs work.
 - **`Ctrl+C` reaches the remote shell and interrupts the running command**,
   exactly as in PuTTY. The session ends when the shell does — type `exit`.
   There is no client-side escape key.
-- **Framing** (`protocol::term`): client → server is
-  `[u8 kind][u32 be len][payload]`, because a resize message has nowhere to
-  live in a raw terminal stream. Server → client stays unframed; it is only
-  ever output. Unknown frame kinds are skipped rather than treated as a
-  desync, so the format can grow.
+- **Framing** (`protocol::term`): `[u8 kind][u32 be len][payload]` in *both*
+  directions now (Data, Resize, Close). The shared connection is reused for the
+  call's reply, so it can never be closed to mean "done" — instead each side
+  sends `Close` and drains to the peer's `Close` before the reply is read.
+  Unknown frame kinds are skipped rather than treated as a desync, so the
+  format can grow.
 - **Input is platform-split, because "raw bytes in" does not mean the same
   thing on both OSes** (`client/src/terminal.rs`, `pump_shell`):
   - **Unix**: a raw-mode tty hands over exactly what a terminal produces —
@@ -367,10 +368,10 @@ is a dumb conduit and full-screen programs work.
     into win32-input-mode. The client already sends ConPTY plain VT and
     never wants that switch applied to the *local* console, so these are
     dropped with no reply.
-- **`TCP_NODELAY`** is set on the session socket by both ends
-  (`terminal::open_session`, `session::open`): a keystroke and its echo are
-  both single-digit-byte writes, and Nagle's algorithm batching them looks
-  exactly like typing lag.
+- **Flushing**: every session write flushes the buffered stream immediately —
+  a keystroke and its echo are single-digit-byte writes, and leaving them in
+  bierpc's `BufStream` until the next larger write looks exactly like typing
+  lag. (The old dedicated socket used `TCP_NODELAY` for the same reason.)
 - **Teardown**: ConPTY holds its end of the output pipe open until the
   pseudoconsole is closed, so the reader thread does *not* see EOF when the
   shell exits. A separate thread waits on the child and signals the session
@@ -452,10 +453,10 @@ by a chatty instance.
   remote dir + filename) · `r` refresh · `Esc` back to Manage.
 - Transfers run as background tasks over the session channel
   (`[u64 BE length][bytes]`), reporting `TransferProgress` into a modal with
-  a gauge (download size comes from `SessionOpened.size`, upload size from
+  a gauge (download size comes from `SessionStart.size`, upload size from
   the local file). Downloads write `<dest>.part` and rename on completion,
-  mirroring the server. Uploads wait for the server's 1-byte commit ack
-  before reporting success.
+  mirroring the server. The persistent call's reply is the commit ack: a
+  `Done` means the server received (and, for archives, unpacked) the bytes.
 
 ---
 
@@ -541,9 +542,9 @@ cargo run -p client --example shell_probe -- 127.0.0.1:5099 target/debug/client.
 This is how the Windows-specific rework in §4.3 was found and verified: the
 byte-forwarding `pump_shell` that shipped first passed every automated test
 because none of them ran on a real console, and only broke once someone
-actually typed into it. `terminal::open_session` stays split out from the
-bridges regardless, so the connection/handshake logic keeps its own
-lightweight coverage independent of either probe.
+actually typed into it. `smoke` and `tui_smoke` drive sessions through
+`net::session` directly (a manual frame reader in place of a TTY), so the
+session/framing logic keeps coverage independent of the ConPTY probes.
 
 Two things to know when working on this:
 
@@ -622,17 +623,23 @@ enum Reply { Signed { timestamp_ms, mac, payload }, Rejected(AuthFailure) }
 
 ### Transport encryption
 
-The RPC channel runs over **TLS 1.3**, and the trust is anchored in the same
-shared key (`protocol::tls`): the server's Ed25519 TLS identity is derived from
-the key via HKDF, and the client pins the derived public key. A peer without
-the key cannot complete the handshake, so an on-path attacker can neither read
-the traffic nor impersonate the server — no certificate files, no CA, no
-first-use trust leap. The HMAC layer above still authenticates the *client* and
-guards replay; TLS authenticates the *server* and encrypts.
+The whole channel runs over **mutual TLS 1.3**, anchored in the shared key
+(`protocol::tls`): *both* ends derive the same Ed25519 identity from the key
+(HKDF) and pin the other's public key, so the handshake completes only if both
+sides hold the key. An on-path attacker can neither read the traffic nor
+impersonate either party — no certificate files, no CA, no first-use trust
+leap. The unary HMAC layer stays on top (client auth + replay guard); mutual
+TLS is what additionally authenticates the client on the session path below.
 
-Session side-channels (terminals, file transfer) still run on their own
-ephemeral ports guarded by a 32-byte token minted over this channel; folding
-them onto the encrypted connection is the next step.
+Session side-channels (terminals, file transfer) run over bierpc's
+**persistent call** on this same connection, not a separate token'd port
+(`protocol::session`). Because the connection is mutually authenticated, a
+session carries no HMAC of its own; the server validates and replies with
+`Result<SessionStart, ApiError>` before any bytes flow. Terminals frame both
+directions and end with an explicit `term::Close` handshake, since the shared
+connection is reused for the call's reply and so can never be closed to mean
+"done"; transfers self-delimit with a length prefix and take the reply as their
+commit ack.
 
 Rotating a key (`server keygen`) locks out every client still holding the old
 one, by design.

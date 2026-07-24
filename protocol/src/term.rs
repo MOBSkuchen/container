@@ -1,24 +1,26 @@
-//! Framing for the interactive shell session's side channel.
+//! Framing for the interactive session side channels.
 //!
-//! A shell session runs against a real PTY, so the bytes in it are the
-//! terminal's own stream — escape sequences and all. That leaves nowhere to
-//! put a window-resize message, which the PTY needs to redraw full-screen
-//! programs correctly. So the **client → server** direction is framed:
+//! A session now rides bierpc's persistent call on the same TLS connection
+//! that carries unary RPC (see `crate::session`), which is reused for the
+//! call's reply afterwards. That connection can never be closed to mean "the
+//! session is over", so **both** directions are framed and end with an
+//! explicit `Close`:
 //!
 //! ```text
 //! [u8 kind][u32 be len][len bytes]
-//!   kind 0  Data    keystrokes, verbatim
-//!   kind 1  Resize  [u16 be cols][u16 be rows]
+//!   kind 0  Data    bytes, verbatim (keystrokes one way, terminal output the other)
+//!   kind 1  Resize  [u16 be cols][u16 be rows]   (client → server only)
+//!   kind 2  Close   empty; "no more session bytes, the reply follows"
 //! ```
 //!
-//! The **server → client** direction stays unframed: it is only ever terminal
-//! output, and framing it would buy nothing but overhead.
-//!
-//! Attach sessions do not use this — they remain a plain line-oriented byte
-//! bridge to the supervised process's pipes.
+//! An unknown kind is skipped, not fatal, so the format can still grow.
+
+use std::io;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const KIND_DATA: u8 = 0;
 pub const KIND_RESIZE: u8 = 1;
+pub const KIND_CLOSE: u8 = 2;
 
 pub const HEADER_LEN: usize = 5;
 
@@ -43,12 +45,39 @@ pub fn resize_frame(cols: u16, rows: u16) -> Vec<u8> {
     out
 }
 
+pub fn close_frame() -> [u8; HEADER_LEN] {
+    [KIND_CLOSE, 0, 0, 0, 0]
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Frame<'a> {
     Data(&'a [u8]),
     Resize { cols: u16, rows: u16 },
+    /// End of session: no more frames follow, the persistent call's reply is next.
+    Close,
     /// A known-length frame of an unrecognised kind: skip it, do not
     /// desynchronise. Lets the format grow without breaking old servers.
+    Unknown,
+}
+
+impl Frame<'_> {
+    pub fn to_owned(&self) -> OwnedFrame {
+        match self {
+            Frame::Data(bytes) => OwnedFrame::Data(bytes.to_vec()),
+            Frame::Resize { cols, rows } => OwnedFrame::Resize { cols: *cols, rows: *rows },
+            Frame::Close => OwnedFrame::Close,
+            Frame::Unknown => OwnedFrame::Unknown,
+        }
+    }
+}
+
+/// The self-owning form yielded by `FrameReader`, so a decoded frame can
+/// outlive the read buffer it came from.
+#[derive(Debug, PartialEq)]
+pub enum OwnedFrame {
+    Data(Vec<u8>),
+    Resize { cols: u16, rows: u16 },
+    Close,
     Unknown,
 }
 
@@ -82,9 +111,73 @@ pub fn decode(buf: &[u8]) -> Decoded<'_> {
             cols: u16::from_be_bytes([payload[0], payload[1]]),
             rows: u16::from_be_bytes([payload[2], payload[3]]),
         },
+        KIND_CLOSE => Frame::Close,
         _ => Frame::Unknown,
     };
     Decoded::Frame(frame, end)
+}
+
+/// Reads whole frames off an async stream, buffering partial ones. Used as a
+/// `select!` branch, so it yields one frame per call rather than looping.
+pub struct FrameReader {
+    pending: Vec<u8>,
+}
+
+impl Default for FrameReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrameReader {
+    pub fn new() -> Self {
+        Self { pending: Vec::new() }
+    }
+
+    /// The next whole frame, `None` at a clean end of stream. A length past
+    /// `MAX_FRAME`, or an EOF mid-frame, is an error.
+    pub async fn next<R: AsyncRead + Unpin>(&mut self, r: &mut R) -> io::Result<Option<OwnedFrame>> {
+        let mut buf = [0u8; 8192];
+        loop {
+            match decode(&self.pending) {
+                Decoded::Frame(frame, used) => {
+                    let owned = frame.to_owned();
+                    self.pending.drain(..used);
+                    return Ok(Some(owned));
+                }
+                Decoded::Invalid => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "session frame length out of range"));
+                }
+                Decoded::Incomplete => {
+                    let n = r.read(&mut buf).await?;
+                    if n == 0 {
+                        return if self.pending.is_empty() {
+                            Ok(None)
+                        } else {
+                            Err(io::Error::new(io::ErrorKind::UnexpectedEof, "stream ended mid-frame"))
+                        };
+                    }
+                    self.pending.extend_from_slice(&buf[..n]);
+                }
+            }
+        }
+    }
+
+    /// End our side of a session: send `Close`, then (unless the peer's `Close`
+    /// was already seen) discard frames until it arrives, leaving the stream
+    /// positioned at the persistent call's reply.
+    pub async fn finish<R, W>(&mut self, r: &mut R, w: &mut W, peer_closed: bool) -> io::Result<()>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        w.write_all(&close_frame()).await?;
+        w.flush().await?;
+        if !peer_closed {
+            while !matches!(self.next(r).await?, None | Some(OwnedFrame::Close)) {}
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -125,6 +218,25 @@ mod tests {
         let mut buf = vec![KIND_DATA];
         buf.extend_from_slice(&u32::MAX.to_be_bytes());
         assert_eq!(decode(&buf), Decoded::Invalid);
+    }
+
+    #[test]
+    fn round_trips_close() {
+        assert_eq!(decode(&close_frame()), Decoded::Frame(Frame::Close, HEADER_LEN));
+    }
+
+    #[tokio::test]
+    async fn frame_reader_yields_frames_then_eof() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&data_frame(b"hi"));
+        stream.extend_from_slice(&resize_frame(80, 24));
+        stream.extend_from_slice(&close_frame());
+        let mut cursor = std::io::Cursor::new(stream);
+        let mut reader = FrameReader::new();
+        assert_eq!(reader.next(&mut cursor).await.unwrap(), Some(OwnedFrame::Data(b"hi".to_vec())));
+        assert_eq!(reader.next(&mut cursor).await.unwrap(), Some(OwnedFrame::Resize { cols: 80, rows: 24 }));
+        assert_eq!(reader.next(&mut cursor).await.unwrap(), Some(OwnedFrame::Close));
+        assert_eq!(reader.next(&mut cursor).await.unwrap(), None);
     }
 
     #[test]

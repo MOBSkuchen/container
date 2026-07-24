@@ -12,13 +12,13 @@ use std::time::Duration;
 use anyhow::Context;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
-use protocol::{Action, TerminalMode, term};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use protocol::term::{self, FrameReader, OwnedFrame};
+use protocol::Session;
+use tokio::io::AsyncWriteExt;
 
 use crate::console::RawConsole;
 use crate::editor::{Keystroke, LineEditor};
-use crate::net::{self, Endpoint};
+use crate::net::{self, Endpoint, SessionStream};
 
 /// Unix only: its shell pump forwards raw stdin bytes, so reading resize
 /// events would mean sharing stdin with the byte pump; Windows gets resizes
@@ -26,26 +26,18 @@ use crate::net::{self, Endpoint};
 #[cfg(not(windows))]
 const RESIZE_POLL: Duration = Duration::from_millis(250);
 
-/// Split out from the bridges so it can be exercised without a TTY.
-pub async fn open_session(endpoint: &Endpoint, mode: TerminalMode) -> anyhow::Result<TcpStream> {
-    net::open_session(endpoint, Action::OpenTerminal { mode }).await
-}
-
 pub fn window_size() -> (u16, u16) {
     crossterm::terminal::size().unwrap_or((80, 24))
 }
 
 pub async fn shell(endpoint: &Endpoint, id: u128, label: &str) -> anyhow::Result<()> {
     let (cols, rows) = window_size();
-    let stream = open_session(endpoint, TerminalMode::Shell { id, cols, rows }).await
-        .with_context(|| format!("opening a shell session on {label}"))?;
-
     println!("── shell on {label} · type 'exit' to end the session ──");
 
-    {
+    net::session(endpoint, Session::Shell { id, cols, rows }, async move |_start, stream| {
         let _console = RawConsole::enter()?;
-        pump_shell(stream, cols, rows).await?;
-    }
+        pump_shell(stream, cols, rows).await
+    }).await.with_context(|| format!("shell session on {label}"))?;
 
     println!("\n── session ended ──");
     Ok(())
@@ -129,10 +121,11 @@ impl OutputFilter {
 /// re-encodes each key into the escape sequence a terminal would have sent,
 /// which ConPTY on the far side parses back into key events for the shell.
 #[cfg(windows)]
-async fn pump_shell(stream: TcpStream, cols: u16, rows: u16) -> anyhow::Result<()> {
+async fn pump_shell(stream: &mut SessionStream, cols: u16, rows: u16) -> anyhow::Result<()> {
     let _ = (cols, rows); // the pty was already created at this size
 
-    let (mut sock_r, mut sock_w) = stream.into_split();
+    let (mut sock_r, mut sock_w) = tokio::io::split(&mut *stream);
+    let mut reader = FrameReader::new();
     let mut stdout = tokio::io::stdout();
     let mut events = EventStream::new();
     let mut tee = open_tee();
@@ -145,7 +138,6 @@ async fn pump_shell(stream: TcpStream, cols: u16, rows: u16) -> anyhow::Result<(
             let _ = file.flush();
         }
     };
-    let mut from_remote = [0u8; 8192];
     let mut filter = OutputFilter::default();
 
     // A Release normally echoes a tracked Press and must be dropped or every
@@ -155,37 +147,43 @@ async fn pump_shell(stream: TcpStream, cols: u16, rows: u16) -> anyhow::Result<(
         std::collections::HashSet::new();
 
     dbg("pump: start".into());
-    loop {
+    // Some(peer_closed) ends with the close handshake; None when the peer is
+    // already gone. A fatal local error is stashed and re-raised after the
+    // handshake, so the server's bridge still ends cleanly.
+    let mut fatal: Option<anyhow::Error> = None;
+    let outcome: Option<bool> = loop {
         tokio::select! {
-            read = sock_r.read(&mut from_remote) => match read {
-                Ok(0) | Err(_) => {
-                    dbg(format!("pump: socket closed ({read:?})"));
-                    return Ok(());
-                }
-                Ok(n) => {
-                    dbg(format!("pump: {n} bytes from remote"));
+            frame = reader.next(&mut sock_r) => match frame {
+                Err(_) | Ok(None) => break None,
+                Ok(Some(OwnedFrame::Close)) => break Some(true),
+                Ok(Some(OwnedFrame::Data(bytes))) => {
+                    dbg(format!("pump: {} bytes from remote", bytes.len()));
                     if let Some(file) = tee.as_mut() {
                         use std::io::Write;
-                        let _ = file.write_all(&from_remote[..n]);
+                        let _ = file.write_all(&bytes);
                     }
-                    let (printable, queries) = filter.feed(&from_remote[..n]);
-                    stdout.write_all(&printable).await?;
-                    stdout.flush().await?;
+                    let (printable, queries) = filter.feed(&bytes);
+                    if let Err(e) = write_stdout(&mut stdout, &printable).await {
+                        fatal = Some(e);
+                        break Some(false);
+                    }
                     // Answered only once everything before the query is on
                     // screen, so the reported position is the one it meant.
                     for _ in 0..queries {
                         let (row, col) = crate::console::cursor_position().unwrap_or((1, 1));
                         dbg(format!("pump: answering cursor query with {row};{col}"));
                         let reply = format!("\x1b[{row};{col}R");
-                        if sock_w.write_all(&term::data_frame(reply.as_bytes())).await.is_err() {
-                            return Ok(());
+                        if send_frame(&mut sock_w, &term::data_frame(reply.as_bytes())).await.is_err() {
+                            break;
                         }
                     }
                 }
+                // Server → client never resizes; ignore anything else.
+                Ok(Some(_)) => {}
             },
             event = events.next() => match event {
-                None => return Ok(()),
-                Some(Err(e)) => return Err(e.into()),
+                None => break Some(false),
+                Some(Err(e)) => { fatal = Some(e.into()); break Some(false); }
                 Some(Ok(Event::Key(key))) => {
                     dbg(format!("pump: key {key:?}"));
                     let forward = match key.kind {
@@ -198,41 +196,61 @@ async fn pump_shell(stream: TcpStream, cols: u16, rows: u16) -> anyhow::Result<(
                     };
                     if forward
                         && let Some(bytes) = encode_key(&key)
-                        && sock_w.write_all(&term::data_frame(&bytes)).await.is_err() {
-                        return Ok(());
+                        && send_frame(&mut sock_w, &term::data_frame(&bytes)).await.is_err() {
+                        break None;
                     }
                 }
                 Some(Ok(Event::Resize(new_cols, new_rows))) => {
                     dbg(format!("pump: resize {new_cols}x{new_rows}"));
-                    if sock_w.write_all(&term::resize_frame(new_cols, new_rows)).await.is_err() {
-                        return Ok(());
+                    if send_frame(&mut sock_w, &term::resize_frame(new_cols, new_rows)).await.is_err() {
+                        break None;
                     }
                 }
                 // Only reported if the remote asked for it (its `\e[?1004h`
                 // passed through to the local console), so it always has a
                 // waiting recipient.
                 Some(Ok(Event::FocusGained)) => {
-                    if sock_w.write_all(&term::data_frame(b"\x1b[I")).await.is_err() {
-                        return Ok(());
+                    if send_frame(&mut sock_w, &term::data_frame(b"\x1b[I")).await.is_err() {
+                        break None;
                     }
                 }
                 Some(Ok(Event::FocusLost)) => {
-                    if sock_w.write_all(&term::data_frame(b"\x1b[O")).await.is_err() {
-                        return Ok(());
+                    if send_frame(&mut sock_w, &term::data_frame(b"\x1b[O")).await.is_err() {
+                        break None;
                     }
                 }
                 Some(Ok(other)) => dbg(format!("pump: ignored {other:?}")),
             },
         }
+    };
+    if let Some(peer_closed) = outcome {
+        let _ = reader.finish(&mut sock_r, &mut sock_w, peer_closed).await;
     }
+    match fatal {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Write and flush one frame; a broken connection ends the session.
+async fn send_frame<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, frame: &[u8]) -> std::io::Result<()> {
+    w.write_all(frame).await?;
+    w.flush().await
+}
+
+async fn write_stdout(stdout: &mut tokio::io::Stdout, bytes: &[u8]) -> anyhow::Result<()> {
+    stdout.write_all(bytes).await?;
+    stdout.flush().await?;
+    Ok(())
 }
 
 /// On unix a raw-mode tty hands over the byte stream exactly as a terminal
 /// produced it, so bytes are forwarded verbatim instead of decoding and
 /// re-encoding events.
 #[cfg(not(windows))]
-async fn pump_shell(stream: TcpStream, mut cols: u16, mut rows: u16) -> anyhow::Result<()> {
-    let (mut sock_r, mut sock_w) = stream.into_split();
+async fn pump_shell(stream: &mut SessionStream, mut cols: u16, mut rows: u16) -> anyhow::Result<()> {
+    let (mut sock_r, mut sock_w) = tokio::io::split(&mut *stream);
+    let mut reader = FrameReader::new();
     let mut stdout = tokio::io::stdout();
     let mut resize_tick = tokio::time::interval(RESIZE_POLL);
     resize_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -259,27 +277,29 @@ async fn pump_shell(stream: TcpStream, mut cols: u16, mut rows: u16) -> anyhow::
         }
     });
 
-    let mut from_remote = [0u8; 8192];
-
-    loop {
+    let mut fatal: Option<anyhow::Error> = None;
+    let outcome: Option<bool> = loop {
         tokio::select! {
-            read = sock_r.read(&mut from_remote) => match read {
-                Ok(0) | Err(_) => return Ok(()),
-                Ok(n) => {
+            frame = reader.next(&mut sock_r) => match frame {
+                Err(_) | Ok(None) => break None,
+                Ok(Some(OwnedFrame::Close)) => break Some(true),
+                Ok(Some(OwnedFrame::Data(bytes))) => {
                     if let Some(file) = tee.as_mut() {
                         use std::io::Write;
-                        let _ = file.write_all(&from_remote[..n]);
+                        let _ = file.write_all(&bytes);
                     }
-                    stdout.write_all(&from_remote[..n]).await?;
-                    stdout.flush().await?;
+                    if let Err(e) = write_stdout(&mut stdout, &bytes).await {
+                        fatal = Some(e);
+                        break Some(false);
+                    }
                 }
+                Ok(Some(_)) => {}
             },
             key = key_rx.recv() => match key {
-                None => return Ok(()),
+                None => break Some(false),
                 Some(bytes) => {
-                    let frame = term::data_frame(&bytes);
-                    if sock_w.write_all(&frame).await.is_err() {
-                        return Ok(());
+                    if send_frame(&mut sock_w, &term::data_frame(&bytes)).await.is_err() {
+                        break None;
                     }
                 }
             },
@@ -288,12 +308,19 @@ async fn pump_shell(stream: TcpStream, mut cols: u16, mut rows: u16) -> anyhow::
                 if (new_cols, new_rows) != (cols, rows) {
                     cols = new_cols;
                     rows = new_rows;
-                    if sock_w.write_all(&term::resize_frame(cols, rows)).await.is_err() {
-                        return Ok(());
+                    if send_frame(&mut sock_w, &term::resize_frame(cols, rows)).await.is_err() {
+                        break None;
                     }
                 }
             }
         }
+    };
+    if let Some(peer_closed) = outcome {
+        let _ = reader.finish(&mut sock_r, &mut sock_w, peer_closed).await;
+    }
+    match fatal {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
@@ -384,17 +411,16 @@ fn ctrl_byte(c: char) -> Option<u8> {
 }
 
 pub async fn attach(endpoint: &Endpoint, id: u128, label: &str) -> anyhow::Result<()> {
-    let stream = open_session(endpoint, TerminalMode::Attach(id)).await
-        .with_context(|| format!("opening an attach session on {label}"))?;
-
     println!("── attached to {label} · Ctrl+C detaches, ↑↓ history, the instance keeps running ──");
 
-    let ended_by_remote = {
+    let mut ended_by_remote = false;
+    net::session(endpoint, Session::Attach(id), async |_start, stream| {
         // RawConsole rather than plain raw mode: the redraws below are ANSI,
         // which a Windows console only interprets with VT processing on.
         let _console = RawConsole::enter()?;
-        pump_attach(stream).await?
-    };
+        ended_by_remote = pump_attach(stream).await?;
+        Ok(())
+    }).await.with_context(|| format!("attach session on {label}"))?;
 
     if ended_by_remote {
         println!("\n── the instance's output stream closed ──");
@@ -421,47 +447,56 @@ fn edit_row(editor: &LineEditor) -> String {
 ///
 /// The editor owns the bottom row; remote output (always whole lines) is
 /// written above it by clearing the row, printing, and putting the row back.
-async fn pump_attach(stream: TcpStream) -> anyhow::Result<bool> {
-    let (mut sock_r, mut sock_w) = stream.into_split();
+async fn pump_attach(stream: &mut SessionStream) -> anyhow::Result<bool> {
+    let (mut sock_r, mut sock_w) = tokio::io::split(&mut *stream);
+    let mut reader = FrameReader::new();
     let mut events = EventStream::new();
     let mut stdout = tokio::io::stdout();
     let mut editor = LineEditor::new();
-    let mut buf = [0u8; 4096];
 
     stdout.write_all(edit_row(&editor).as_bytes()).await?;
     stdout.flush().await?;
 
-    loop {
+    let mut fatal: Option<anyhow::Error> = None;
+    let outcome: Option<bool> = loop {
         tokio::select! {
-            read = sock_r.read(&mut buf) => match read {
-                Ok(0) | Err(_) => return Ok(true),
-                Ok(n) => {
+            frame = reader.next(&mut sock_r) => match frame {
+                Err(_) | Ok(None) => break None,
+                Ok(Some(OwnedFrame::Close)) => break Some(true),
+                Ok(Some(OwnedFrame::Data(bytes))) => {
                     let mut out = b"\r\x1b[K".to_vec();
-                    out.extend_from_slice(&crlf(&buf[..n]));
+                    out.extend_from_slice(&crlf(&bytes));
                     out.extend_from_slice(edit_row(&editor).as_bytes());
-                    stdout.write_all(&out).await?;
-                    stdout.flush().await?;
+                    if let Err(e) = write_stdout(&mut stdout, &out).await {
+                        fatal = Some(e);
+                        break Some(false);
+                    }
                 }
+                Ok(Some(_)) => {}
             },
             event = events.next() => match event {
-                None => return Ok(false),
-                Some(Err(e)) => return Err(e.into()),
+                None => break Some(false),
+                Some(Err(e)) => { fatal = Some(e.into()); break Some(false); }
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                     if is_ctrl(&key, 'c') {
-                        return Ok(false);
+                        break Some(false);
                     }
                     match editor.handle(&key) {
                         Keystroke::Ignored => {}
                         Keystroke::Edited => {
-                            stdout.write_all(edit_row(&editor).as_bytes()).await?;
-                            stdout.flush().await?;
+                            if let Err(e) = write_stdout(&mut stdout, edit_row(&editor).as_bytes()).await {
+                                fatal = Some(e);
+                                break Some(false);
+                            }
                         }
                         Keystroke::Submit(text) => {
                             // Scroll the submitted line away, then a fresh prompt.
-                            stdout.write_all(format!("\r\n{}", edit_row(&editor)).as_bytes()).await?;
-                            stdout.flush().await?;
-                            if sock_w.write_all(text.as_bytes()).await.is_err() {
-                                return Ok(true);
+                            if let Err(e) = write_stdout(&mut stdout, format!("\r\n{}", edit_row(&editor)).as_bytes()).await {
+                                fatal = Some(e);
+                                break Some(false);
+                            }
+                            if send_frame(&mut sock_w, &term::data_frame(text.as_bytes())).await.is_err() {
+                                break None;
                             }
                         }
                     }
@@ -469,6 +504,14 @@ async fn pump_attach(stream: TcpStream) -> anyhow::Result<bool> {
                 Some(Ok(_)) => {}
             },
         }
+    };
+    let ended_by_remote = !matches!(outcome, Some(false));
+    if let Some(peer_closed) = outcome {
+        let _ = reader.finish(&mut sock_r, &mut sock_w, peer_closed).await;
+    }
+    match fatal {
+        Some(e) => Err(e),
+        None => Ok(ended_by_remote),
     }
 }
 
