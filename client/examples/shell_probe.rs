@@ -14,12 +14,11 @@
 //! Usage: cargo run -p client --example shell_probe -- <server-addr> <client-exe>
 
 use std::io::{Read, Write};
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-
+use bierpc::rpc::Target;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use protocol::{Action, ErrorCode, RepoState, Response, RetryPolicy, Source, auth};
 
@@ -33,14 +32,14 @@ const PHRASE: &str = "smoke-test-passphrase";
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
 
-fn endpoint(addr: SocketAddr) -> Endpoint {
+fn endpoint(addr: Target) -> Endpoint {
     Endpoint::new(addr, auth::hash_or_random(Some(PHRASE)).to_vec())
 }
 
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1);
-    let addr = SocketAddr::from_str(&args.next().expect("server addr")).expect("bad addr");
+    let addr = Target::from_str(&args.next().expect("server addr")).expect("bad addr");
     let client_exe = PathBuf::from(args.next().expect("path to client.exe"));
     assert!(client_exe.exists(), "no client binary at {}", client_exe.display());
 

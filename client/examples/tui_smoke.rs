@@ -9,11 +9,10 @@
 //! Not a product surface: it exists so the TUI can be verified without a
 //! human at a terminal.
 
-use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
+use bierpc::rpc::Target;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -39,7 +38,7 @@ fn key_bytes() -> Vec<u8> {
     KEY.get_or_init(|| auth::hash_or_random(Some(PHRASE)).to_vec()).clone()
 }
 
-fn endpoint(addr: SocketAddr) -> Endpoint {
+fn endpoint(addr: Target) -> Endpoint {
     Endpoint::new(addr, key_bytes())
 }
 
@@ -93,7 +92,7 @@ fn assert_hides(terminal: &Terminal<TestBackend>, needle: &str, what: &str) {
 
 #[tokio::main]
 async fn main() {
-    let addr = SocketAddr::from_str(
+    let addr = Target::from_str(
         &std::env::args().nth(1).unwrap_or("127.0.0.1:5000".to_string())
     ).expect("bad server address");
 
@@ -398,7 +397,7 @@ async fn settle(app: &mut App, rx: &mut mpsc::Receiver<AppEvent>) {
     pump(app, rx, Duration::from_millis(1500)).await;
 }
 
-async fn wait_repo_ready(addr: SocketAddr, id: u128) {
+async fn wait_repo_ready(addr: Target, id: u128) {
     for _ in 0..120 {
         match client::net::check(&endpoint(addr), id).await.expect("check failed").repo {
             RepoState::Ready => return,
@@ -509,7 +508,7 @@ async fn end_terminal(reader: &mut FrameReader, stream: &mut SessionStream) {
     while !matches!(reader.next(stream).await, Ok(None) | Ok(Some(OwnedFrame::Close)) | Err(_)) {}
 }
 
-async fn create_instance(addr: SocketAddr) -> u128 {
+async fn create_instance(addr: Target) -> u128 {
     // Drop a leftover from an aborted run first.
     if let Ok(Response::InstanceList(list)) = client::net::call(&endpoint(addr), Action::ListInstances).await
         && let Some(old) = list.iter().find(|i| i.name == INSTANCE) {
@@ -531,7 +530,7 @@ async fn create_instance(addr: SocketAddr) -> u128 {
     }
 }
 
-async fn remove_instance(addr: SocketAddr, id: u128) {
+async fn remove_instance(addr: Target, id: u128) {
     // A clone may still be running; retry until the server lets it go.
     // Already-gone is the normal case when the test removed it itself.
     for _ in 0..60 {

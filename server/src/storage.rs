@@ -1,8 +1,9 @@
 use bierpc::serialize::Serialize;
 use bierpc::serialize::Deserialize;
-use std::net::{SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use bier_derive::{Deserialize, Serialize};
+use bierpc::rpc::Target;
 use tokio::fs;
 
 /// The persisted instance definition is the same type the client sends.
@@ -10,7 +11,7 @@ pub use protocol::instance::InstanceConfig;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ServerStg {
-    pub addr: SocketAddr,
+    pub addr: Target,
     pub config_path: PathBuf,
     pub storage_path: PathBuf,
     /// Roots (besides the instances dir) that file upload/download may touch.
@@ -48,7 +49,7 @@ impl ServerStg {
     }
 
     pub async fn new(
-        addr: SocketAddr,
+        addr: Target,
         config_path: PathBuf,
         storage_path: PathBuf,
         file_roots: Vec<PathBuf>,

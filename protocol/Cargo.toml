@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bier_derive = { path = "../../rpc/bier_derive" }
-bierpc = { path = "../../rpc/bierpc" }
+bier_derive = { path = "../../bierpc/bier_derive" }
+bierpc = { path = "../../bierpc/bierpc" }
 # bier_derive's generated code refers to `tokio` directly.
 tokio = { version = "1.52.3", features = ["io-util"] }
 sha2 = "0.10.9"

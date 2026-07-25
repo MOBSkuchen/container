@@ -6,13 +6,14 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
+use bierpc::rpc::Target;
 use protocol::auth;
 use server::storage::{default_shell, ServerStg};
 
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1);
-    let addr = SocketAddr::from_str(&args.next().expect("addr")).expect("bad addr");
+    let addr = Target::from_str(&args.next().expect("addr")).expect("bad addr");
     let config = PathBuf::from(args.next().expect("config path"));
     let storage = PathBuf::from(args.next().expect("storage path"));
     let phrase = args.next().expect("auth phrase");

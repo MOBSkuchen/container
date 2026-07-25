@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bier_derive = {path = "../../rpc/bier_derive" }
-bierpc = {path = "../../rpc/bierpc" }
+bier_derive = {path = "../../bierpc/bier_derive" }
+bierpc = {path = "../../bierpc/bierpc" }
 protocol = { path = "../protocol" }
 clap = "4.6.1"
 clap_derive = "4.6.1"

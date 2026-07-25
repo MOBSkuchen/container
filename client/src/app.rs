@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
+use bierpc::rpc::Target;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::{Stream, StreamExt};
 use ratatui::Terminal;
@@ -379,7 +379,7 @@ impl App {
         });
     }
 
-    fn add_server(&mut self, name: String, addr: SocketAddr) {
+    fn add_server(&mut self, name: String, addr: Target) {
         let entry = ServerEntry::new(name, addr);
         self.states.insert(entry.id, ServerState::default());
         self.bootstrap_offers.insert(entry.id);
@@ -1139,7 +1139,7 @@ impl App {
                         form.error = Some("a name is required".to_string());
                         return;
                     }
-                    let addr = match addr_text.parse::<SocketAddr>() {
+                    let addr = match addr_text.parse::<Target>() {
                         Ok(a) => a,
                         Err(e) => {
                             form.error = Some(format!("'{addr_text}' is not a host:port address ({e})"));

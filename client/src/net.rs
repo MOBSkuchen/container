@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use bierpc::error::RpcError;
-use bierpc::rpc::{ClientConfig, ClientStream, RpcClient};
+use bierpc::rpc::{ClientConfig, ClientStream, RpcClient, Target};
 use bierpc::serialize::Deserialize;
 use protocol::{auth, tls};
 use protocol::{
@@ -37,7 +37,7 @@ fn client_config(key: &[u8]) -> ClientConfig {
 /// Tell "nothing is listening" apart from "the handshake was rejected". A TLS
 /// pin mismatch is a key problem, not an unreachable host, and deserves the
 /// keygen hint rather than "is the server running?".
-fn connect_error(addr: SocketAddr, e: RpcError) -> NetError {
+fn connect_error(addr: Target, e: RpcError) -> NetError {
     let refused = matches!(&e, RpcError::IoError { err } if matches!(
         err.kind(),
         std::io::ErrorKind::ConnectionRefused
@@ -109,7 +109,7 @@ impl NetError {
 }
 
 /// One authenticated round trip: sign the action, dial, verify the reply.
-pub async fn call_with_key(addr: SocketAddr, key: &[u8], action: Action) -> Result<Response, NetError> {
+pub async fn call_with_key(addr: Target, key: &[u8], action: Action) -> Result<Response, NetError> {
     if key.len() != auth::KEY_LEN {
         return Err(NetError::NoKey);
     }
@@ -119,7 +119,7 @@ pub async fn call_with_key(addr: SocketAddr, key: &[u8], action: Action) -> Resu
     let request = auth::sign_request(key, payload);
     let nonce = request.nonce.clone();
 
-    let mut client = RpcClient::<Request>::new_with_config(addr, client_config(key)).await
+    let mut client = RpcClient::<Request>::new_with_config(addr.to_socket_addr(), client_config(key)).await
         .map_err(|e| connect_error(addr, e))?;
 
     let reply = client.call::<Reply>(request).await
@@ -138,12 +138,12 @@ pub async fn call_with_key(addr: SocketAddr, key: &[u8], action: Action) -> Resu
 /// can accidentally talk to one server with another's key.
 #[derive(Clone, Debug)]
 pub struct Endpoint {
-    pub addr: SocketAddr,
+    pub addr: Target,
     pub key: Vec<u8>,
 }
 
 impl Endpoint {
-    pub fn new(addr: SocketAddr, key: Vec<u8>) -> Self {
+    pub fn new(addr: Target, key: Vec<u8>) -> Self {
         Self { addr, key }
     }
 }
@@ -255,7 +255,7 @@ where
     F: AsyncFnOnce(SessionStart, &mut SessionStream) -> anyhow::Result<()>,
 {
     let addr = endpoint.addr;
-    let mut client = RpcClient::<Request, Session>::new_with_config(addr, client_config(&endpoint.key)).await
+    let mut client = RpcClient::<Request, Session>::new_with_config(addr.to_socket_addr(), client_config(&endpoint.key)).await
         .map_err(|e| anyhow::anyhow!("{}", connect_error(addr, e)))?;
 
     // The body's own error (as opposed to a transport error) is captured here

@@ -1,7 +1,7 @@
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::str::FromStr;
-use bierpc::rpc::{RpcServer, ServerConfig};
+use bierpc::rpc::{RpcServer, ServerConfig, Target};
 use clap::Parser;
 use console::Term;
 use protocol::auth;
@@ -16,7 +16,7 @@ async fn _init(config_file: PathBuf) -> anyhow::Result<()> {
 
     // Loopback by default: the channel authenticates but does not encrypt, so
     // wider exposure should be a deliberate choice (see the prompt text).
-    let addr: SocketAddrV4 = gather_value_routine(&term, "Server address (0.0.0.0 exposes every interface — trusted networks only): ", Some(SocketAddrV4::from_str("127.0.0.1:5000").unwrap()))?;
+    let addr: Target = gather_value_routine(&term, "Server address (0.0.0.0 exposes every interface — trusted networks only): ", Some(Target::from_str("127.0.0.1:5000").unwrap()))?;
     let storage_path: PathBuf = gather_value_routine(&term, "Storage path: ", Some(PathBuf::from_str("ctchld").unwrap()))?;
     let config_path: PathBuf = gather_value_routine(&term, "Config file: ", Some(config_file))?;
     let file_roots: String = gather_value_routine(&term, "File roots (';'-separated, empty for none): ", Some(String::new()))?;
@@ -35,7 +35,7 @@ async fn _init(config_file: PathBuf) -> anyhow::Result<()> {
     let key = auth::hash_or_random(Some(phrase.trim()).filter(|p| !p.is_empty())).to_vec();
 
     let (server_stg, _instances) = ServerStg::new(
-        SocketAddr::V4(addr),
+        addr,
         config_path,
         storage_path,
         file_roots,
@@ -114,7 +114,7 @@ async fn _start(config_path: PathBuf, bootstrap: bool) -> anyhow::Result<()> {
     // for it to release the address before claiming it.
     if std::env::var_os("CHLD_TAKEOVER").is_some() {
         for _ in 0..40 {
-            match tokio::net::TcpListener::bind(stg.addr).await {
+            match tokio::net::TcpListener::bind(stg.addr.to_socket_addr()).await {
                 Ok(probe) => { drop(probe); break }
                 Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
             }
@@ -132,7 +132,7 @@ async fn _start(config_path: PathBuf, bootstrap: bool) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("building the TLS identity: {e}"))?;
 
     println!("Starting server on {}", stg.addr);
-    let server = RpcServer::new(stg.addr, handler)
+    let server = RpcServer::new(stg.addr.to_socket_addr(), handler)
         .await
         .map_err(|e| anyhow::anyhow!("failed to bind {}: {:?}", stg.addr, e))?
         .with_persistence(session_handler)

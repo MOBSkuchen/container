@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use bier_derive::{Deserialize, Serialize};
+use bierpc::rpc::Target;
 use bierpc::serialize::{Deserialize, Serialize};
 use protocol::auth;
 use tokio::fs;
@@ -12,13 +13,13 @@ pub struct ServerEntry {
     /// local identity
     pub id: u128,
     pub name: String,
-    pub addr: SocketAddr,
+    pub addr: Target,
     /// Per-server key. When empty, the default key is used.
     pub key: Vec<u8>,
 }
 
 impl ServerEntry {
-    pub fn new(name: String, addr: SocketAddr) -> Self {
+    pub fn new(name: String, addr: Target) -> Self {
         Self { id: rand::random::<u128>(), name, addr, key: Vec::new() }
     }
 }
