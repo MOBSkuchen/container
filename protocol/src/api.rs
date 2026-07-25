@@ -93,6 +93,8 @@ pub enum Response {
     /// Generic success for actions with no payload.
     Done,
     StatResponse {
+        version: u32,
+
         total_stg: u64,
         free_stg: u64,
 

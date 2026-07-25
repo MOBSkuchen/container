@@ -64,6 +64,8 @@ pub enum Source {
     /// over an `UploadSource` session. `desc` records what was pushed, for
     /// display only.
     Upload { desc: String },
+    /// User handles the source themselves
+    Empty,
     /// Nothing to materialize; used by the self-managed server entry.
     None,
 }
@@ -87,6 +89,7 @@ pub struct InstanceConfig {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct InstanceStatus {
+    pub version: u32,
     pub config: InstanceConfig,
     pub repo: RepoState,
     pub run: RunState,

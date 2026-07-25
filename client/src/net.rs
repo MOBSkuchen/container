@@ -169,18 +169,20 @@ pub struct Vitals {
     pub instances: Vec<InstanceStatResponse>,
     /// The server would honor `Bootstrap` right now.
     pub bootstrap: bool,
+    pub version: u32,
 }
 
 pub async fn stat(endpoint: &Endpoint) -> Result<Vitals, NetError> {
     match call(endpoint, Action::Stat).await? {
         Response::StatResponse {
             total_stg, free_stg, total_ram, free_ram,
-            network_recv, network_trans, cpu_usage, instances, bootstrap,
+            network_recv, network_trans, cpu_usage, instances,
+            bootstrap, version
         } => Ok(Vitals {
             total_stg, free_stg, total_ram, free_ram,
             network_recv, network_trans, cpu_usage,
             instances: sorted_by_name(instances),
-            bootstrap,
+            bootstrap, version
         }),
         other => Err(unexpected("StatResponse", other)),
     }

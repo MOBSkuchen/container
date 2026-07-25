@@ -4,7 +4,7 @@ use bierpc::error::RpcResult;
 use bierpc::rpc::RpcServerHandler;
 use std::sync::Mutex;
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, Networks, RefreshKind, System};
-use protocol::auth;
+use protocol::{auth, VERSION};
 use crate::manager::{InstanceManager, InstancePatch};
 use crate::storage::{ServerStg, InstanceConfig};
 use crate::transfer;
@@ -92,6 +92,7 @@ impl Api {
             .map_err(|e| bierpc::error::RpcError::from(std::io::Error::other(format!("stat sampling panicked: {e}"))))?;
 
         Ok(Response::StatResponse {
+            version: VERSION,
             total_stg,
             free_stg,
             total_ram,

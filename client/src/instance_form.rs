@@ -20,7 +20,7 @@ pub const POLICY: usize = 8;
 pub const RETRIES: usize = 9;
 
 const POLICIES: [&str; 4] = ["Never", "OnCrash", "Always", "Retry"];
-const SOURCES: [&str; 3] = ["Git", "URL", "Upload"];
+const SOURCES: [&str; 4] = ["Git", "URL", "Upload", "Empty"];
 
 pub fn build(existing: Option<&InstanceConfig>) -> Form {
     let title = match existing {
@@ -36,7 +36,7 @@ pub fn build(existing: Option<&InstanceConfig>) -> Form {
     };
 
     let (source_index, location, branch) = match existing.map(|c| &c.source) {
-        None | Some(Source::None) => (0, String::new(), String::new()),
+        None | Some(Source::None) | Some(Source::Empty) => (0, String::new(), String::new()),
         Some(Source::Git { url, branch }) => (0, url.clone(), branch.clone().unwrap_or_default()),
         Some(Source::Url { url }) => (1, url.clone(), String::new()),
         Some(Source::Upload { desc }) => (2, desc.clone(), String::new()),
@@ -47,9 +47,10 @@ pub fn build(existing: Option<&InstanceConfig>) -> Form {
             Source::Git { .. } => "git url",
             Source::Url { .. } => "download url",
             Source::Upload { .. } => "local path",
-            Source::None => "git url, download url or a local path"
+            Source::Empty => "no source initialized",
+            Source::None => "git url, download url or a local path - or nothing"
         }
-    } else { "git url, download url or a local path" };
+    } else { "git url, download url or a local path - or nothing" };
 
     let fields = vec![
         Field::text("Name", existing.map(|c| c.name.as_str()).unwrap_or("")),
@@ -81,6 +82,7 @@ pub enum SourceSpec {
     /// Editing an Upload instance without giving a new path: the content on
     /// the server stays as it is.
     UploadKeep { desc: String },
+    Nothing
 }
 
 /// Everything the form yields, validated. Field order matches `Action`'s
@@ -97,17 +99,19 @@ pub struct Parsed {
 /// `keep_desc` is the recorded description when editing an Upload instance;
 /// leaving the location at that text means "keep the uploaded content".
 pub fn parse(form: &Form, keep_desc: Option<&str>) -> Result<Parsed, String> {
+    let empty = form.field(SOURCE).select_index() == 3;
+
     let name = form.field(NAME).text_value().trim().to_string();
     if name.is_empty() {
         return Err("a name is required".to_string());
     }
     let command = form.field(COMMAND).text_value().trim().to_string();
-    if command.is_empty() {
+    if command.is_empty() && !empty {
         return Err("a command is required".to_string());
     }
 
     let location = form.field(LOCATION).text_value().trim().to_string();
-    if location.is_empty() {
+    if location.is_empty() && !empty {
         return Err("a location is required".to_string());
     }
     let branch = match form.field(BRANCH).text_value().trim() {
@@ -117,15 +121,18 @@ pub fn parse(form: &Form, keep_desc: Option<&str>) -> Result<Parsed, String> {
     let source = match form.field(SOURCE).select_index() {
         0 => SourceSpec::Git { url: location, branch },
         1 => SourceSpec::Url { url: location },
-        _ if Some(location.as_str()) == keep_desc => {
+        2 if Some(location.as_str()) == keep_desc => {
             SourceSpec::UploadKeep { desc: location }
         }
-        _ => {
+        2 => {
             let path = PathBuf::from(&location);
             if !path.exists() {
                 return Err(format!("'{location}' does not exist here, so there is nothing to upload"));
             }
             SourceSpec::Upload { path }
+        }
+        _ => {
+            SourceSpec::Nothing
         }
     };
 
@@ -168,6 +175,7 @@ impl SourceSpec {
                     .unwrap_or_else(|| path.display().to_string()),
             },
             SourceSpec::UploadKeep { desc } => Source::Upload { desc: desc.clone() },
+            SourceSpec::Nothing => Source::Empty
         }
     }
 
@@ -189,7 +197,7 @@ pub fn fmt_source(source: &Source) -> String {
         }
         Source::Url { url } => format!("{url} (download)"),
         Source::Upload { desc } => format!("uploaded '{desc}'"),
-        Source::None => "—".to_string(),
+        Source::None | Source::Empty => "—".to_string(),
     }
 }
 

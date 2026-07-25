@@ -229,6 +229,8 @@ pub enum Modal {
         toggle: Option<ConfirmToggle>,
         pending: Pending,
     },
+    /// Informational popup; any key dismisses it.
+    Notice { title: String, message: String },
     Help,
 }
 
@@ -257,6 +259,9 @@ pub struct App {
     /// Servers added this session: the first poll that says they support
     /// bootstrapping triggers a one-time offer.
     bootstrap_offers: HashSet<u128>,
+    /// Servers added this session whose protocol version has not been
+    /// compared against ours yet; the first successful poll does it.
+    version_checks: HashSet<u128>,
 
     config_path: PathBuf,
     book_tx: watch::Sender<Book>,
@@ -276,7 +281,7 @@ impl App {
         Self {
             book, states, screens: vec![Screen::Landing], cursor: 0,
             modal: None, toast: None, should_quit: false, pending_session: None,
-            bootstrap_offers: HashSet::new(),
+            bootstrap_offers: HashSet::new(), version_checks: HashSet::new(),
             config_path, book_tx, refresh, events_tx,
         }
     }
@@ -383,6 +388,7 @@ impl App {
         let entry = ServerEntry::new(name, addr);
         self.states.insert(entry.id, ServerState::default());
         self.bootstrap_offers.insert(entry.id);
+        self.version_checks.insert(entry.id);
         self.book.servers.push(entry);
         self.publish_servers();
         self.refresh.notify_one();
@@ -469,6 +475,7 @@ impl App {
                 }
                 self.clamp_cursor();
                 self.sync_manage(server);
+                self.check_version(server);
                 self.offer_bootstrap(server);
             }
             AppEvent::Detail { server, instance, result } => {
@@ -1029,6 +1036,35 @@ impl App {
             .unwrap_or_else(|| format!("{instance:032x}"))
     }
 
+    /// Compare protocol versions once for a freshly added server. A mismatch
+    /// warrants a modal — unlike the bootstrap hint below it must not be
+    /// missable — but never on top of another one: while something else is
+    /// open the server stays in the set and the next poll retries.
+    fn check_version(&mut self, server: u128) {
+        if !self.version_checks.contains(&server) || self.modal.is_some() {
+            return;
+        }
+        let Some(vitals) = self.states.get(&server).and_then(|s| s.vitals.as_ref()) else { return };
+        let theirs = vitals.version;
+        self.version_checks.remove(&server);
+        if theirs == protocol::VERSION {
+            return;
+        }
+        let name = self.entry(server).map(|e| e.name.clone()).unwrap_or_default();
+        let advice = if theirs > protocol::VERSION {
+            "The client is older — update this client to manage that server."
+        } else {
+            "The server is older — update the server before managing it from here."
+        };
+        self.modal = Some(Modal::Notice {
+            title: "Version mismatch".to_string(),
+            message: format!(
+                "'{name}' speaks protocol version {theirs}, this client version {}.\n{advice}",
+                protocol::VERSION,
+            ),
+        });
+    }
+
     /// Point out bootstrapping once for a freshly added server that supports
     /// it. A toast, deliberately not a modal: a dialog popping up on a poll
     /// event could swallow a keypress meant for the tree.
@@ -1115,7 +1151,7 @@ impl App {
         }
 
         match self.modal.as_mut() {
-            Some(Modal::Help) => self.modal = None,
+            Some(Modal::Help) | Some(Modal::Notice { .. }) => self.modal = None,
 
             Some(Modal::Confirm { toggle, .. }) => match key.code {
                 KeyCode::Char(' ') => {
@@ -1152,6 +1188,11 @@ impl App {
                         Some(id) => {
                             if let Some(entry) = self.book.servers.iter_mut().find(|s| s.id == id) {
                                 entry.name = name.clone();
+                                // A new address may be a whole different
+                                // server, so its version is unknown again.
+                                if entry.addr != addr {
+                                    self.version_checks.insert(id);
+                                }
                                 entry.addr = addr;
                             }
                             // Rates from the old address are meaningless now.

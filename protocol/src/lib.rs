@@ -23,3 +23,5 @@ pub use instance::{
     ConsoleLine, GroupStats, InstanceConfig, InstanceStatResponse, InstanceStatus, RepoState,
     RetryPolicy, RunState, Source, Stream,
 };
+
+pub const VERSION: u32 = 1;

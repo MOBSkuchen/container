@@ -51,6 +51,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Some(Modal::Confirm { title, message, toggle, .. }) => {
             draw_confirm(frame, title, message, toggle.as_ref())
         }
+        Some(Modal::Notice { title, message }) => draw_notice(frame, title, message),
         None => {}
     }
 }
@@ -818,6 +819,22 @@ fn draw_confirm(frame: &mut Frame, title: &str, message: &str, toggle: Option<&C
         Span::styled(" confirm    ", Style::new().fg(DIM)),
         Span::styled("n/esc", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::styled(" cancel", Style::new().fg(DIM)),
+    ]));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn draw_notice(frame: &mut Frame, title: &str, message: &str) {
+    let height = message.lines().count() as u16 + 5;
+    let area = modal_area(frame, 66, height);
+    frame.render_widget(Clear, area);
+    frame.render_widget(modal_block(title), area);
+
+    let inner = area.inner(ratatui::layout::Margin::new(2, 1));
+    let mut lines: Vec<Line> = message.lines().map(Line::raw).collect();
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("any key", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(" dismiss", Style::new().fg(DIM)),
     ]));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }

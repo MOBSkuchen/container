@@ -16,6 +16,7 @@ pub use protocol::instance::{
     ConsoleLine, GroupStats, InstanceStatResponse, InstanceStatus, RepoState, RetryPolicy,
     RunState, Source, Stream,
 };
+use protocol::VERSION;
 
 /// How many console lines are kept per instance. Bounded because an instance
 /// can run for weeks and nothing else prunes this.
@@ -467,6 +468,7 @@ impl InstanceManager {
                 .unwrap_or_else(|_| self.stg.repo_dir(id))
         };
         Ok(InstanceStatus {
+            version: VERSION,
             config: mi.config.clone(),
             repo: mi.repo.clone(),
             run: mi.run_state(),
