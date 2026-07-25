@@ -17,7 +17,7 @@ pub async fn materialize(source: &Source, dest: PathBuf) -> Result<(), String> {
         Source::Url { url } => fetch_url(url, &dest).await,
         Source::Upload { .. } => Err("content is uploaded from a client; push it instead".to_string()),
         Source::None => Err("this instance has no source".to_string()),
-        Source ::Empty => Ok(())
+        Source::Empty => fs::create_dir_all(dest).await.map_err(|e| {e.to_string()})
     }
 }
 
