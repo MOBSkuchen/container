@@ -1,5 +1,7 @@
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::path::PathBuf;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use bierpc::rpc::{RpcServer, ServerConfig, Target};
 use clap::Parser;
@@ -11,14 +13,42 @@ use server::manager::InstanceManager;
 use server::session_handler::SessionApi;
 use server::storage::{default_shell, ServerStg};
 
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DisplayPath(pub PathBuf);
+
+impl fmt::Display for DisplayPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0.display(), f) // lossy: invalid bytes -> U+FFFD
+    }
+}
+impl fmt::Debug for DisplayPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+impl Deref for DisplayPath {          // .join/.parent/.extension/... for free
+    type Target = Path;
+    fn deref(&self) -> &Path { &self.0 }
+}
+impl From<PathBuf> for DisplayPath { fn from(p: PathBuf) -> Self { Self(p) } }
+impl From<&Path> for DisplayPath { fn from(p: &Path) -> Self { Self(p.to_path_buf()) } }
+
+impl FromStr for DisplayPath {
+    type Err = core::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(DisplayPath::from(PathBuf::from_str(s)?))
+    }
+}
+
 async fn _init(config_file: PathBuf) -> anyhow::Result<()> {
     let term = Term::stdout();
 
     // Loopback by default: the channel authenticates but does not encrypt, so
     // wider exposure should be a deliberate choice (see the prompt text).
     let addr: Target = gather_value_routine(&term, "Server address (0.0.0.0 exposes every interface — trusted networks only): ", Some(Target::from_str("127.0.0.1:5000").unwrap()))?;
-    let storage_path: PathBuf = gather_value_routine(&term, "Storage path: ", Some(PathBuf::from_str("ctchld").unwrap()))?;
-    let config_path: PathBuf = gather_value_routine(&term, "Config file: ", Some(config_file))?;
+    let storage_path: DisplayPath = gather_value_routine(&term, "Storage path: ", Some(DisplayPath::from_str("ctchld").unwrap()))?;
+    let config_path: DisplayPath = gather_value_routine(&term, "Config file: ", Some(config_file.into()))?;
     let file_roots: String = gather_value_routine(&term, "File roots (';'-separated, empty for none): ", Some(String::new()))?;
     let session_ttl_secs: u64 = gather_value_routine(&term, "Session TTL (seconds): ", Some(30))?;
     let shell: String = gather_value_routine(&term, "Terminal shell: ", Some(default_shell()))?;
@@ -36,8 +66,8 @@ async fn _init(config_file: PathBuf) -> anyhow::Result<()> {
 
     let (server_stg, _instances) = ServerStg::new(
         addr,
-        config_path,
-        storage_path,
+        config_path.0,
+        storage_path.0,
         file_roots,
         session_ttl_secs,
         shell,

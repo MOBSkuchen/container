@@ -43,7 +43,7 @@ pub enum Commands {
     StopRunaway,
 }
 
-fn _user_input_read_as<CastType: FromStr + Send + Sync + std::fmt::Debug>(term: &Term, initial: &str, default: Option<CastType>) -> anyhow::Result<CastType>
+fn _user_input_read_as<CastType: FromStr + Send + Sync + std::fmt::Display>(term: &Term, initial: &str, default: Option<CastType>) -> anyhow::Result<CastType>
 where <CastType as FromStr>::Err: std::error::Error,
       <CastType as FromStr>::Err: Send,
       <CastType as FromStr>::Err: Sync,
@@ -53,7 +53,7 @@ where <CastType as FromStr>::Err: std::error::Error,
     term.clear_line()?;
     term.write_line(initial)?;
     if let Some(d) = default.clone() {
-        term.write_line(format!("(default: {:#?})", d).as_str())?;
+        term.write_line(format!("(default: {d})").as_str())?;
         term.move_cursor_up(2)?;
         term.move_cursor_right(initial.len())?;
     }
@@ -84,7 +84,7 @@ fn _cl_print_val(term: &Term, val: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn gather_value_routine<CastType: FromStr + Send + Sync + std::fmt::Debug>(term: &Term, initial: &str, default: Option<CastType>) -> anyhow::Result<CastType>
+pub fn gather_value_routine<CastType: FromStr + Send + Sync + std::fmt::Display>(term: &Term, initial: &str, default: Option<CastType>) -> anyhow::Result<CastType>
 where <CastType as FromStr>::Err: std::error::Error,
       <CastType as FromStr>::Err: Send,
       <CastType as FromStr>::Err: Sync,
@@ -93,6 +93,6 @@ where <CastType as FromStr>::Err: std::error::Error,
 {
     term.write_line("")?;
     let val = _user_input_read_as(term, initial, default)?;
-    _cl_print_val(term, format!("{initial}{:#?}", val).as_str())?;
+    _cl_print_val(term, format!("{initial}{val}").as_str())?;
     Ok(val)
 }
