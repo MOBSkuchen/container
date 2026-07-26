@@ -187,7 +187,19 @@ impl InstanceManager {
             let repo = if config.self_managed || stg.repo_dir(config.id).exists() {
                 RepoState::Ready
             } else {
-                RepoState::CloneFailed("repo directory missing; run UpdateRepo".to_string())
+                // The remedy depends on the source; "run UpdateRepo" on an
+                // Upload instance would only earn a second error.
+                match &config.source {
+                    // An Empty dir carries no content to lose; recreate it.
+                    Source::Empty => match std::fs::create_dir_all(stg.repo_dir(config.id)) {
+                        Ok(()) => RepoState::Ready,
+                        Err(e) => RepoState::CloneFailed(format!("recreating the instance directory: {e}")),
+                    },
+                    Source::Upload { .. } => RepoState::CloneFailed(
+                        "content missing — push it again from a client".to_string(),
+                    ),
+                    _ => RepoState::CloneFailed("repo directory missing; run UpdateRepo".to_string()),
+                }
             };
             instances.insert(config.id, ManagedInstance {
                 config, repo, service: None, console: Default::default(),
@@ -223,9 +235,11 @@ impl InstanceManager {
         config.id = rand::random::<u128>();
         let id = config.id;
 
-        // Upload sources also start Provisioning: they are "being prepared"
-        // until the client's push lands.
-        let fetch = matches!(config.source, Source::Git { .. } | Source::Url { .. });
+        // Upload sources stay Provisioning until the client's push lands.
+        // Everything else fetches now — for Empty that just creates the
+        // directory — because an instance nothing ever moves out of
+        // Provisioning is unrunnable and unremovable alike.
+        let fetch = !matches!(config.source, Source::Upload { .. });
         {
             let mut instances = self.instances.lock().await;
             if instances.values().any(|mi| mi.config.name == config.name) {
@@ -358,6 +372,11 @@ impl InstanceManager {
             RepoState::Provisioning => return Err(err(ErrorCode::Provisioning, "the source is still being prepared")),
             RepoState::CloneFailed(e) => return Err(err(ErrorCode::GitError, format!("the source is not available: {e}"))),
             RepoState::Ready => {}
+        }
+        // Legal on an Empty instance that only holds files; catch it here
+        // rather than as a baffling spawn failure.
+        if mi.config.command.trim().is_empty() {
+            return Err(err(ErrorCode::Conflict, "this instance has no command — edit it and set one first"));
         }
         if mi.is_active() {
             return Err(err(ErrorCode::AlreadyRunning, "instance is already running"));

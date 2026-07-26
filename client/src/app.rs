@@ -20,6 +20,7 @@ use protocol::{Action, ConsoleLine, DirEntry, InstanceStatResponse, InstanceStat
 
 use crate::book::{self, Book, ServerEntry};
 use crate::browse::{self, Browse, Side, Transfer};
+use crate::edit::EditRequest;
 use crate::form::{Field, Form, FormOutcome};
 use crate::instance_form;
 use crate::net::{self, Endpoint, NetError, Vitals};
@@ -138,6 +139,11 @@ pub struct Manage {
     pub console_error: Option<String>,
     /// Lines scrolled back from the bottom. 0 = following the newest output
     pub console_scroll: usize,
+    /// Rows the detail pane is scrolled down when its content overflows.
+    pub detail_scroll: usize,
+    /// How far the detail pane can scroll, written back by the renderer —
+    /// only it knows the wrapped row count at the current width.
+    pub detail_max_scroll: std::cell::Cell<usize>,
 }
 
 impl Manage {
@@ -147,6 +153,7 @@ impl Manage {
             detail: None, detail_error: None,
             console: Vec::new(), console_dropped: 0, console_error: None,
             console_scroll: 0,
+            detail_scroll: 0, detail_max_scroll: std::cell::Cell::new(0),
         }
     }
 
@@ -200,10 +207,12 @@ pub struct SessionRequest {
     pub label: String,
 }
 
-/// Why `run` returned: for good, or to lend the console to a session.
+/// Why `run` returned: for good, or to lend the console to a session or to
+/// the user's editor.
 pub enum RunOutcome {
     Quit,
     Session(SessionRequest),
+    Edit(EditRequest),
 }
 
 pub struct ConfirmToggle {
@@ -256,6 +265,8 @@ pub struct App {
     pub should_quit: bool,
     /// A shell/attach request the run loop hands back to `main` to execute.
     pub pending_session: Option<SessionRequest>,
+    /// An edit request the run loop hands back to `main` the same way.
+    pub pending_edit: Option<EditRequest>,
     /// Servers added this session: the first poll that says they support
     /// bootstrapping triggers a one-time offer.
     bootstrap_offers: HashSet<u128>,
@@ -280,7 +291,8 @@ impl App {
         let states = book.servers.iter().map(|s| (s.id, ServerState::default())).collect();
         Self {
             book, states, screens: vec![Screen::Landing], cursor: 0,
-            modal: None, toast: None, should_quit: false, pending_session: None,
+            modal: None, toast: None, should_quit: false,
+            pending_session: None, pending_edit: None,
             bootstrap_offers: HashSet::new(), version_checks: HashSet::new(),
             config_path, book_tx, refresh, events_tx,
         }
@@ -671,6 +683,9 @@ impl App {
             KeyCode::End => self.scroll_console(isize::MIN),
             KeyCode::Home => self.scroll_console(isize::MAX),
 
+            KeyCode::Char(',') => self.scroll_detail(-1),
+            KeyCode::Char('.') => self.scroll_detail(1),
+
             KeyCode::Char('r') => self.spawn_action("start", server, Action::RunInstance { id: instance }),
             KeyCode::Char('R') => self.request_restart(),
             KeyCode::Char('x') => self.spawn_action("stop", server, Action::StopInstance { id: instance }),
@@ -780,9 +795,33 @@ impl App {
                 }
             }
             KeyCode::Char('c') | KeyCode::F(5) => self.plan_transfer(),
+            KeyCode::Char('e') | KeyCode::F(4) => self.browse_edit(),
             KeyCode::Char('r') => self.browse_refresh(),
             _ => {}
         }
+    }
+
+    /// Hand the file under the cursor to the user's editor; the run loop
+    /// returns it to `main`, which owns the terminal.
+    fn browse_edit(&mut self) {
+        let Some(b) = self.browse() else { return };
+        let (side, server) = (b.focus, b.server);
+        let panel = b.panel(side);
+        let (cwd, entry) = (panel.cwd.clone(), panel.under_cursor().cloned());
+        let Some(entry) = entry else {
+            self.error("nothing under the cursor");
+            return;
+        };
+        if entry.is_dir {
+            self.error("that is a directory — only files can be edited");
+            return;
+        }
+        let Some(endpoint) = self.endpoint(server) else { return };
+        self.pending_edit = Some(EditRequest {
+            endpoint, side,
+            path: cwd.join(&entry.name),
+            name: entry.name,
+        });
     }
 
     fn browse_move(&mut self, delta: isize) {
@@ -828,7 +867,8 @@ impl App {
         }
     }
 
-    fn browse_refresh(&mut self) {
+    /// Public because `main` refreshes the panels after an edit round trip.
+    pub fn browse_refresh(&mut self) {
         let Some(b) = self.browse_mut() else { return };
         let server = b.server;
         let (local, remote) = (b.local.cwd.clone(), b.remote.cwd.clone());
@@ -918,6 +958,16 @@ impl App {
             let result = result.map(|_| format!("copied {what}")).map_err(|e| format!("{e:#}"));
             let _ = tx.send(AppEvent::TransferDone { server, result }).await;
         });
+    }
+
+    /// Scroll the detail pane, clamped to the overflow the last render saw.
+    fn scroll_detail(&mut self, delta: isize) {
+        let Some(Screen::Manage(m)) = self.screens.last_mut() else { return };
+        m.detail_scroll = if delta < 0 {
+            m.detail_scroll.saturating_sub(delta.unsigned_abs())
+        } else {
+            (m.detail_scroll + delta as usize).min(m.detail_max_scroll.get())
+        };
     }
 
     /// Positive scrolls back into history; `isize::MIN` returns to following
@@ -1316,6 +1366,9 @@ impl App {
             }
             if let Some(request) = self.pending_session.take() {
                 return Ok(RunOutcome::Session(request));
+            }
+            if let Some(request) = self.pending_edit.take() {
+                return Ok(RunOutcome::Edit(request));
             }
         }
     }

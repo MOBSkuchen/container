@@ -239,14 +239,53 @@ fn instance_status(inst: &InstanceStatResponse) -> (&'static str, String, Style)
 fn draw_manage(frame: &mut Frame, app: &App, manage: &Manage, area: Rect) {
     let [side, main] = Layout::horizontal([Constraint::Length(30), Constraint::Min(20)]).areas(area);
     let [vitals, list] = Layout::vertical([Constraint::Length(8), Constraint::Min(3)]).areas(side);
-    // Detail is a fixed shape; give the rest to the console, which is the
-    // part you actually sit and watch.
-    let [detail, console] = Layout::vertical([Constraint::Length(16), Constraint::Min(4)]).areas(main);
+
+    // The detail pane takes what its content needs — its tail holds the
+    // terminal instructions and the checkout path, which must not silently
+    // fall off — and the console gets the rest, kept usable at 6 rows. When
+    // even that is not enough, the pane scrolls (, and .).
+    let content = detail_content(app, manage);
+    let inner_w = main.width.saturating_sub(2).max(1) as usize;
+    let rows = wrap_lines(&content, inner_w);
+    let wanted = rows.len() as u16 + 2;
+    let detail_h = wanted.min(main.height.saturating_sub(6)).max(3);
+    let [detail, console] = Layout::vertical([Constraint::Length(detail_h), Constraint::Min(4)]).areas(main);
 
     draw_vitals(frame, app, manage, vitals);
     draw_sidebar_instances(frame, app, manage, list);
-    draw_detail(frame, app, manage, detail);
+    draw_detail(frame, app, manage, rows, detail);
     draw_console(frame, manage, console);
+}
+
+/// Character-exact wrap of styled lines to `width` columns. Used where a
+/// scroll range must agree with what is on screen — `Wrap` cannot provide
+/// that, since it does not report its rendered row count.
+fn wrap_lines(lines: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for line in lines {
+        let mut row: Vec<Span> = Vec::new();
+        let mut used = 0;
+        for span in &line.spans {
+            let mut chunk = String::new();
+            for c in span.content.chars() {
+                if used == width {
+                    if !chunk.is_empty() {
+                        row.push(Span::styled(std::mem::take(&mut chunk), span.style));
+                    }
+                    out.push(Line::from(std::mem::take(&mut row)));
+                    used = 0;
+                }
+                chunk.push(c);
+                used += 1;
+            }
+            if !chunk.is_empty() {
+                row.push(Span::styled(chunk, span.style));
+            }
+        }
+        out.push(Line::from(row));
+    }
+    out
 }
 
 fn draw_console(frame: &mut Frame, manage: &Manage, area: Rect) {
@@ -392,24 +431,42 @@ fn draw_sidebar_instances(frame: &mut Frame, app: &App, manage: &Manage, area: R
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_detail(frame: &mut Frame, app: &App, manage: &Manage, area: Rect) {
+fn detail_content(app: &App, manage: &Manage) -> Vec<Line<'static>> {
+    match (&manage.detail, &manage.detail_error) {
+        (Some(detail), _) => detail_lines(app, manage, detail),
+        (None, Some(e)) => vec![Line::styled(format!("could not read this instance: {e}"), Style::new().fg(Color::Red))],
+        (None, None) => vec![Line::styled("loading…", Style::new().fg(DIM))],
+    }
+}
+
+/// `rows` are already wrapped to this pane's inner width.
+fn draw_detail(frame: &mut Frame, app: &App, manage: &Manage, rows: Vec<Line<'static>>, area: Rect) {
     let name = app.instances_of(manage.server).iter()
         .find(|i| i.id == manage.instance)
         .map(|i| i.name.clone())
         .unwrap_or_else(|| format!("{:032x}", manage.instance));
 
-    let block = Block::bordered()
+    let visible = area.height.saturating_sub(2) as usize;
+    let max_scroll = rows.len().saturating_sub(visible);
+    manage.detail_max_scroll.set(max_scroll);
+    let scroll = manage.detail_scroll.min(max_scroll);
+
+    let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(DIM))
         .title(Span::styled(format!(" {name} "), Style::new().add_modifier(Modifier::BOLD)));
+    if scroll > 0 {
+        block = block.title_bottom(Span::styled(" ↑ , ", Style::new().fg(ACCENT)));
+    }
+    if scroll < max_scroll {
+        block = block.title_bottom(Span::styled(
+            format!(" ↓ {} more (.) ", max_scroll - scroll),
+            Style::new().fg(ACCENT),
+        ));
+    }
 
-    let lines = match (&manage.detail, &manage.detail_error) {
-        (Some(detail), _) => detail_lines(app, manage, detail),
-        (None, Some(e)) => vec![Line::styled(format!("could not read this instance: {e}"), Style::new().fg(Color::Red))],
-        (None, None) => vec![Line::styled("loading…", Style::new().fg(DIM))],
-    };
-
-    frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), area);
+    let end = (scroll + visible).min(rows.len());
+    frame.render_widget(Paragraph::new(rows[scroll..end].to_vec()).block(block), area);
 }
 
 fn detail_lines(app: &App, manage: &Manage, detail: &InstanceStatus) -> Vec<Line<'static>> {
@@ -683,14 +740,14 @@ const LANDING_KEYS: &[(&str, &str)] = &[
 ];
 
 const MANAGE_KEYS: &[(&str, &str)] = &[
-    ("↑↓", "instance"), ("pgup/pgdn", "console"), ("r", "start"), ("R", "restart"),
-    ("x", "stop"), ("k", "kill"), ("u", "update repo"), ("s", "shell"), ("a", "attach"),
-    ("b", "files"), ("e", "edit"), ("D", "remove"), ("?", "help"), ("esc", "back"),
+    ("↑↓", "instance"), ("pgup/pgdn", "console"), (",/.", "details"), ("r", "start"),
+    ("R", "restart"), ("x", "stop"), ("k", "kill"), ("u", "update repo"), ("s", "shell"),
+    ("a", "attach"), ("b", "files"), ("e", "edit"), ("D", "remove"), ("?", "help"), ("esc", "back"),
 ];
 
 const BROWSE_KEYS: &[(&str, &str)] = &[
     ("tab", "panel"), ("↑↓", "move"), ("enter", "open"), ("bksp", "up"),
-    ("space", "mark"), ("c", "copy"), ("r", "reload"), ("?", "help"), ("esc", "back"),
+    ("space", "mark"), ("c", "copy"), ("e", "edit"), ("r", "reload"), ("?", "help"), ("esc", "back"),
 ];
 
 fn draw_keys(frame: &mut Frame, area: Rect, keys: &[(&str, &str)]) {
@@ -719,14 +776,47 @@ fn modal_block(title: &str) -> Block<'static> {
 }
 
 fn draw_form(frame: &mut Frame, form: &Form) {
-    let height = form.fields.len() as u16 * 2 + 5;
-    let area = modal_area(frame, 64, height);
+    const WIDTH: u16 = 64;
+    let inner_w = (WIDTH as usize).saturating_sub(4).max(1);
+
+    // The footer — a validation error, or the key hints — is pinned below
+    // the fields, so it stays visible however many fields there are and
+    // however small the terminal is.
+    let footer: Vec<Line> = match &form.error {
+        Some(e) => {
+            let mut rows = wrap_lines(&[Line::styled(e.clone(), Style::new().fg(Color::Red))], inner_w);
+            rows.truncate(3);
+            rows
+        }
+        None => vec![Line::styled("tab/↑↓ field   enter save   esc cancel", Style::new().fg(DIM))],
+    };
+    let footer_rows = footer.len() as u16;
+
+    let area = modal_area(frame, WIDTH, form.fields.len() as u16 * 2 + footer_rows + 3);
     frame.render_widget(Clear, area);
-    frame.render_widget(modal_block(&form.title), area);
 
     let inner = area.inner(ratatui::layout::Margin::new(2, 1));
+    let [fields_area, footer_area] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(footer_rows),
+    ]).areas(inner);
+
+    // The viewport follows the focused field, so tabbing below the fold
+    // scrolls the form rather than editing out of sight.
+    let visible = (fields_area.height as usize / 2).max(1);
+    let first = (form.focus + 1).saturating_sub(visible);
+
+    let mut block = modal_block(&form.title);
+    if first > 0 {
+        block = block.title_bottom(Span::styled(" ↑ more ", Style::new().fg(ACCENT)));
+    }
+    if first + visible < form.fields.len() {
+        block = block.title_bottom(Span::styled(" ↓ more ", Style::new().fg(ACCENT)));
+    }
+    frame.render_widget(block, area);
+
     let mut lines: Vec<Line> = Vec::new();
-    for (i, field) in form.fields.iter().enumerate() {
+    for (i, field) in form.fields.iter().enumerate().skip(first).take(visible) {
         let focused = i == form.focus;
         let label_style = if focused {
             Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
@@ -742,25 +832,7 @@ fn draw_form(frame: &mut Frame, form: &Form) {
         let value = match &field.kind {
             // A block cursor drawn in-line: the real cursor stays hidden, so
             // it cannot disagree with what the modal shows.
-            FieldKind::Text { value, cursor } => {
-                let text: String = value.iter().collect();
-                if focused {
-                    let (before, after) = text.split_at(
-                        value.iter().take(*cursor).map(|c| c.len_utf8()).sum(),
-                    );
-                    let (at, rest) = match after.chars().next() {
-                        Some(c) => (c.to_string(), &after[c.len_utf8()..]),
-                        None => (" ".to_string(), ""),
-                    };
-                    Line::from(vec![
-                        Span::raw(before.to_string()),
-                        Span::styled(at, Style::new().add_modifier(Modifier::REVERSED)),
-                        Span::raw(rest.to_string()),
-                    ])
-                } else {
-                    Line::raw(text)
-                }
-            }
+            FieldKind::Text { value, cursor } => text_field_line(value, *cursor, focused, inner_w),
             FieldKind::Toggle(b) => Line::from(vec![
                 Span::styled(if *b { "[x] yes" } else { "[ ] no" },
                     if *b { Style::new().fg(Color::Green) } else { Style::new().fg(DIM) }),
@@ -782,14 +854,38 @@ fn draw_form(frame: &mut Frame, form: &Form) {
         };
         lines.push(value);
     }
+    frame.render_widget(Paragraph::new(lines), fields_area);
+    frame.render_widget(Paragraph::new(footer), footer_area);
+}
 
-    lines.push(Line::raw(""));
-    lines.push(match &form.error {
-        Some(e) => Line::styled(e.clone(), Style::new().fg(Color::Red)),
-        None => Line::styled("tab/↑↓ field   enter save   esc cancel", Style::new().fg(DIM)),
-    });
+/// A text value on a single row: long values slide horizontally under the
+/// cursor instead of wrapping, which would shove every field below them off
+/// the modal.
+fn text_field_line(value: &[char], cursor: usize, focused: bool, width: usize) -> Line<'static> {
+    if !focused {
+        let text: String = if value.len() > width {
+            let mut t: String = value.iter().take(width.saturating_sub(1)).collect();
+            t.push('…');
+            t
+        } else {
+            value.iter().collect()
+        };
+        return Line::raw(text);
+    }
 
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    let start = (cursor + 1).saturating_sub(width);
+    let window: Vec<char> = value.iter().skip(start).take(width).copied().collect();
+    let at = cursor - start;
+    let before: String = window[..at].iter().collect();
+    let (at_char, rest) = match window.get(at) {
+        Some(&c) => (c.to_string(), window[at + 1..].iter().collect::<String>()),
+        None => (" ".to_string(), String::new()),
+    };
+    Line::from(vec![
+        Span::raw(before),
+        Span::styled(at_char, Style::new().add_modifier(Modifier::REVERSED)),
+        Span::raw(rest),
+    ])
 }
 
 fn draw_confirm(frame: &mut Frame, title: &str, message: &str, toggle: Option<&ConfirmToggle>) {
@@ -856,6 +952,7 @@ fn draw_help(frame: &mut Frame, app: &App) {
             ("↑ ↓ / [ ]", "switch instance on this server"),
             ("pgup / pgdn", "scroll the console"),
             ("home / end", "oldest line / back to following"),
+            (", / .", "scroll the instance details"),
             ("r", "start"),
             ("R", "restart — on the self instance, the whole server"),
             ("x", "stop, with a grace period"),
@@ -876,6 +973,7 @@ fn draw_help(frame: &mut Frame, app: &App) {
             ("backspace", "go to the parent directory"),
             ("space", "mark / unmark the entry under the cursor"),
             ("c / F5", "copy the marked entries into the other panel"),
+            ("e / F4", "edit the file under the cursor (the TUI steps aside)"),
             ("r", "reload both panels"),
             ("esc", "back"),
         ],
@@ -893,6 +991,8 @@ fn draw_help(frame: &mut Frame, app: &App) {
             "With nothing marked, c copies the entry under the cursor.",
             "Copies are packed, streamed, then unpacked; existing files",
             "prompt for overwrite-or-skip before anything moves.",
+            "e opens $VISUAL/$EDITOR, or the OS default editor; a remote",
+            "file is fetched first and uploaded back once you save.",
         ],
     };
 
@@ -947,5 +1047,75 @@ fn first_line(text: &str) -> String {
         format!("{}…", line.chars().take(59).collect::<String>())
     } else {
         line.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::form::Field;
+    use crate::instance_form;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn rendered(width: u16, height: u16, form: &Form) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw_form(f, form)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string())
+            .collect()
+    }
+
+    /// The instance form is taller than a 20-row terminal; the footer must be
+    /// pinned regardless, and the focused field must scroll into view.
+    #[test]
+    fn form_footer_and_focus_survive_a_short_terminal() {
+        let mut form = instance_form::build(None);
+        let text = rendered(80, 20, &form).join("\n");
+        assert!(text.contains("enter save"), "instructions clipped:\n{text}");
+        assert!(text.contains("↓ more"), "no hint that fields are clipped below:\n{text}");
+        assert!(text.contains("Name"), "first field not visible:\n{text}");
+
+        form.focus = instance_form::RETRIES;
+        let text = rendered(80, 20, &form).join("\n");
+        assert!(text.contains("Retry limit"), "focused field out of view:\n{text}");
+        assert!(text.contains("↑ more"), "no hint that fields are clipped above:\n{text}");
+        assert!(text.contains("enter save"), "instructions clipped after scrolling:\n{text}");
+
+        form.error = Some("a name is required".to_string());
+        let text = rendered(80, 20, &form).join("\n");
+        assert!(text.contains("a name is required"), "error clipped:\n{text}");
+    }
+
+    /// A value longer than the modal must slide under the cursor on one row,
+    /// not wrap and push later fields (and the footer) off.
+    #[test]
+    fn long_values_stay_on_one_row() {
+        let long = "x".repeat(200);
+        let form = Form::new("t", vec![Field::text("Location", &long), Field::text("Other", "")]);
+        let text = rendered(80, 24, &form).join("\n");
+        assert!(text.contains("Other"), "field after a long value vanished:\n{text}");
+        assert!(text.contains("enter save"), "footer pushed off by a long value:\n{text}");
+    }
+
+    #[test]
+    fn wrap_lines_is_exact() {
+        let lines = vec![
+            Line::raw("abcdef"),
+            Line::raw(""),
+            Line::from(vec![Span::raw("123"), Span::styled("4567", Style::new().fg(ACCENT))]),
+        ];
+        let wrapped = wrap_lines(&lines, 4);
+        let texts: Vec<String> = wrapped.iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(texts, ["abcd", "ef", "", "1234", "567"]);
+        // The styled span keeps its style across the break.
+        assert_eq!(wrapped[3].spans[1].style, Style::new().fg(ACCENT));
     }
 }

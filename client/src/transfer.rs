@@ -99,6 +99,40 @@ async fn upload_archive(
     }).await
 }
 
+/// Pull one remote file into the local file `dest` (the editor's fetch).
+/// Small enough to skip the archive dance — the wire format is the same
+/// length-prefixed stream the archive sessions use.
+pub async fn download_file(endpoint: &Endpoint, src: PathBuf, dest: &Path) -> anyhow::Result<()> {
+    let dest = dest.to_path_buf();
+    net::session(endpoint, Session::DownloadFile { src }, async move |_start, stream| {
+        let mut len_buf = [0u8; 8];
+        stream.read_exact(&mut len_buf).await.context("waiting for the file size")?;
+        let total = u64::from_be_bytes(len_buf);
+
+        let mut file = tokio::fs::File::create(&dest).await.context("creating the local copy")?;
+        let copied = tokio::io::copy(&mut (&mut *stream).take(total), &mut file).await
+            .context("the connection dropped mid-transfer")?;
+        anyhow::ensure!(copied == total, "connection closed after {copied} of {total} bytes");
+        file.flush().await.context("writing the local copy")?;
+        Ok(())
+    }).await
+}
+
+/// Push one local file to the remote path `dest` (the editor's write-back).
+pub async fn upload_file(endpoint: &Endpoint, src: &Path, dest: PathBuf) -> anyhow::Result<()> {
+    let src = src.to_path_buf();
+    net::session(endpoint, Session::UploadFile { dest }, async move |_start, stream| {
+        let mut file = tokio::fs::File::open(&src).await.context("opening the edited file")?;
+        let total = file.metadata().await.context("reading the edited file")?.len();
+        stream.write_all(&total.to_be_bytes()).await.context("sending the file size")?;
+        let copied = tokio::io::copy(&mut file, stream).await
+            .context("the connection dropped mid-transfer")?;
+        anyhow::ensure!(copied == total, "the file changed size mid-upload ({copied} of {total} bytes)");
+        stream.flush().await.context("flushing the upload")?;
+        Ok(())
+    }).await
+}
+
 /// Pull `sources` (remote files or directories) into the local directory
 /// `dest`. The total becomes known once the server has finished packing.
 pub async fn download(

@@ -235,6 +235,18 @@ async fn tui(book: Book, config_path: PathBuf, browse: Option<BrowseStart>) -> a
                     app.error(format!("{} on {}: {e:#}", request.kind.verb(), request.label));
                 }
             }
+            Ok(RunOutcome::Edit(request)) => {
+                drop(input);
+                ratatui::restore();
+                let outcome = client::edit::run(&request).await;
+                terminal = ratatui::init();
+                match outcome {
+                    Ok(summary) => app.info(summary),
+                    Err(e) => app.error(format!("edit '{}' failed — {e:#}", request.name)),
+                }
+                // The panels may now be showing a stale size or mtime.
+                app.browse_refresh();
+            }
             Err(e) => break Err(e),
         }
     };

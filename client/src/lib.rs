@@ -8,6 +8,7 @@ pub mod app;
 pub mod book;
 pub mod browse;
 pub mod console;
+pub mod edit;
 pub mod editor;
 pub mod form;
 pub mod instance_form;
