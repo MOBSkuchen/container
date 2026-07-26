@@ -5,8 +5,8 @@ edition = "2024"
 
 [dependencies]
 protocol = { path = "../protocol" }
-bier_derive = { path = "../../bierpc/bier_derive" }
-bierpc = { path = "../../bierpc/bierpc" }
+bier_derive = { version = "1.0.0", git = "https://github.com/MOBSkuchen/bierpc" }
+bierpc = { version = "1.0.0", git = "https://github.com/MOBSkuchen/bierpc" }
 anyhow = "1.0.103"
 tokio = { version = "1.52.3", features = ["full"] }
 clap = { version = "4.6.1", features = ["derive"] }
