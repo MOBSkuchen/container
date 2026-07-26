@@ -36,10 +36,13 @@ pub fn build(existing: Option<&InstanceConfig>) -> Form {
     };
 
     let (source_index, location, branch) = match existing.map(|c| &c.source) {
-        None | Some(Source::None) | Some(Source::Empty) => (0, String::new(), String::new()),
+        None | Some(Source::None) => (0, String::new(), String::new()),
         Some(Source::Git { url, branch }) => (0, url.clone(), branch.clone().unwrap_or_default()),
         Some(Source::Url { url }) => (1, url.clone(), String::new()),
         Some(Source::Upload { desc }) => (2, desc.clone(), String::new()),
+        // Round-trips: reopening the form must not silently turn an Empty
+        // instance into a Git one with a blank URL.
+        Some(Source::Empty) => (3, String::new(), String::new()),
     };
 
     let s = if let Some(existing) = existing {
@@ -47,7 +50,7 @@ pub fn build(existing: Option<&InstanceConfig>) -> Form {
             Source::Git { .. } => "git url",
             Source::Url { .. } => "download url",
             Source::Upload { .. } => "local path",
-            Source::Empty => "no source initialized",
+            Source::Empty => "unused — an Empty source has no location",
             Source::None => "git url, download url or a local path - or nothing"
         }
     } else { "git url, download url or a local path - or nothing" };
@@ -197,7 +200,8 @@ pub fn fmt_source(source: &Source) -> String {
         }
         Source::Url { url } => format!("{url} (download)"),
         Source::Upload { desc } => format!("uploaded '{desc}'"),
-        Source::None | Source::Empty => "—".to_string(),
+        Source::Empty => "empty — content is managed by hand".to_string(),
+        Source::None => "—".to_string(),
     }
 }
 
